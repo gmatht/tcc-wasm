@@ -533,6 +533,7 @@ static void w_emit_slot_store(int r, int bt)
     int scr = (bt == VT_FLOAT) ? W_SCRATCH_F32
             : (bt == VT_DOUBLE) ? W_SCRATCH_F64
             : W_SCRATCH_LOCAL;
+                w_slot_ofs(r), ind);
     w_local_set(scr);
     w_emit_slot_addr(r);
     w_local_get(scr);
@@ -794,6 +795,7 @@ ST_FUNC void load(int r, SValue *sv)
         return;
     }
     if (sv->r & VT_LVAL) {
+                    r, sv->r & VT_VALMASK, (void *)sv->sym, (int)sv->c.i, bt);
         w_emit_deref(sv);
         w_emit_slot_store(r, bt);
         return;
