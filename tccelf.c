@@ -3264,11 +3264,17 @@ static int elf_output_obj(TCCState *s1, const char *filename)
     return ret;
 }
 
+#ifdef TCC_TARGET_WASM32
+ST_FUNC int wasm_output_file(TCCState *s, const char *filename);
+#endif
 LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
 {
     s->nb_errors = 0;
     if (s->test_coverage)
         tcc_tcov_add_file(s, filename);
+#ifdef TCC_TARGET_WASM32
+    return wasm_output_file(s, filename);
+#else
     if (s->output_type == TCC_OUTPUT_OBJ)
         return elf_output_obj(s, filename);
 #ifdef TCC_TARGET_PE
@@ -3277,6 +3283,7 @@ LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
     return macho_output_file(s, filename);
 #else
     return elf_output_file(s, filename);
+#endif
 #endif
 }
 

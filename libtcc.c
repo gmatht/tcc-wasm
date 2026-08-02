@@ -53,6 +53,9 @@
 #include "riscv64-gen.c"
 #include "riscv64-link.c"
 #include "riscv64-asm.c"
+#elif defined(TCC_TARGET_WASM32)
+#include "wasm32-gen.c"
+#include "wasm32-link.c"
 #else
 #error unknown target
 #endif
@@ -1004,6 +1007,8 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
     tcc_add_macos_sdkpath(s);
 # endif
 
+#elif defined TCC_TARGET_WASM32
+    /* no crt objects, no libc — the wasm module is self-contained */
 #else
     /* paths for crt objects */
     tcc_split_path(s, &s->crt_paths, &s->nb_crt_paths, CONFIG_TCC_CRTPREFIX);
