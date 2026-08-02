@@ -982,8 +982,9 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     w_local_tee(W_FP_LOCAL);                /* fp = sp */
     w_ins(W_I32_CONST);
     w_frame_patch = ind;
-    for (i = 0; i < 4; i++)
+    for (i = 0; i < 4; i++) {
         g(0x80);
+    }
     g(0x00);   /* 5-byte slot */
     w_ins(W_I32_SUB);
     w_global_set();                         /* sp = fp - frame */
@@ -1838,7 +1839,8 @@ static void w_layout(void)
     {
         /* exact code-buffer offset -> final offset map (the layout
            reorders sub-blocks, so this must be exact, not derived) */
-        int *rmap_cs = NULL, *rmap_ce = NULL, *rmap_fs = NULL;
+        typedef struct { int cs, ce, fs; } RMap;
+        RMap *rmap = NULL;
         int nrmap = 0, rmap_alloc = 0;
         for (i = nsubs - 1; i >= 0; i--) {
         WSub *s = &subs[i];
@@ -1849,12 +1851,10 @@ static void w_layout(void)
             int seg = s->parts[k].seg;
             int pos = s->parts[k].start, e = s->parts[k].end;
             if (e > pos) {
-                rmap_cs = wa_grow(rmap_cs, &rmap_alloc, nrmap + 1, sizeof(int));
-                rmap_ce = wa_grow(rmap_ce, &rmap_alloc, nrmap + 1, sizeof(int));
-                rmap_fs = wa_grow(rmap_fs, &rmap_alloc, nrmap + 1, sizeof(int));
-                rmap_cs[nrmap] = pos;
-                rmap_ce[nrmap] = e;
-                rmap_fs[nrmap] = blen;
+                rmap = wa_grow(rmap, &rmap_alloc, nrmap + 1, sizeof(RMap));
+                rmap[nrmap].cs = pos;
+                rmap[nrmap].ce = e;
+                rmap[nrmap].fs = blen;
                 nrmap++;
             }
             while (pos < e) {
@@ -1916,8 +1916,8 @@ static void w_layout(void)
             if (p->ofs >= w_body_start) {
                 int r, ok = 0;
                 for (r = 0; r < nrmap; r++) {
-                    if (p->ofs >= rmap_cs[r] && p->ofs < rmap_ce[r]) {
-                        p->ofs = rmap_fs[r] + (p->ofs - rmap_cs[r]);
+                    if (p->ofs >= rmap[r].cs && p->ofs < rmap[r].ce) {
+                        p->ofs = rmap[r].fs + (p->ofs - rmap[r].cs);
                         ok = 1;
                         break;
                     }
@@ -1926,9 +1926,7 @@ static void w_layout(void)
                     tcc_error("wasm: patch outside mapped code");
             }
         }
-        tcc_free(rmap_cs);
-        tcc_free(rmap_ce);
-        tcc_free(rmap_fs);
+        tcc_free(rmap);
     }
     /* close switch / loop / exit / function */
     body = wa_grow(body, &balloc, blen + 8, 1);
