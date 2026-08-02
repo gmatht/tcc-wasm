@@ -283,7 +283,7 @@ typedef struct WasmFunc {
     WasmBlk *blks;       int nblks, blk_alloc;
     int *inspos;         int nins, ins_alloc;
     int cur_seg, cur_blk;
-    int *posblks;        int nposblks;    /* (pos -> block) pairs for gind targets */
+    int *posblks;        int nposblks, posblk_alloc;  /* (pos,block) pairs */
     int nparams;         /* wasm params */
     int nlocals;         /* wasm locals (fp, pc) */
     int has_sret;
@@ -618,7 +618,7 @@ static void w_new_block(void)
     wasm_cf->blks[b].ls = wasm_cf->cur_seg;
     wasm_cf->cur_blk = b;
     /* record (pos -> block) */
-    wasm_cf->posblks = wa_grow(wasm_cf->posblks, &wasm_cf->nposblks,
+    wasm_cf->posblks = wa_grow(wasm_cf->posblks, &wasm_cf->posblk_alloc,
                                wasm_cf->nposblks + 1, sizeof(int) * 2);
     wasm_cf->posblks[wasm_cf->nposblks * 2] = ind;
     wasm_cf->posblks[wasm_cf->nposblks * 2 + 1] = b;
