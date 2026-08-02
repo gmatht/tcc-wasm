@@ -204,10 +204,10 @@ ST_DATA int func_bound_add_epilog;
 #define W_F32_SUB      0x94
 #define W_F32_MUL      0x95
 #define W_F32_DIV      0x96
-#define W_F64_ADD      0x9f
-#define W_F64_SUB      0xa0
-#define W_F64_MUL      0xa1
-#define W_F64_DIV      0xa2
+#define W_F64_ADD      0xa0
+#define W_F64_SUB      0xa1
+#define W_F64_MUL      0xa2
+#define W_F64_DIV      0xa3
 #define W_I32_WRAP     0xa7
 #define W_I32_TRUNC_F32_S 0xa8
 #define W_I32_TRUNC_F32_U 0xa9
@@ -259,6 +259,8 @@ typedef struct WasmPatch {
     int ofs;             /* offset in the function body */
     Sym *sym;            /* referenced symbol (NULL for frame-size) */
     int kind;            /* 0 = function index, 1 = data address */
+    int dsec, dofs;      /* data symbol: section index + offset (kind 1),
+                            captured at patch time (sym->c is not stable) */
 } WasmPatch;
 
 /* per-function state */
@@ -315,10 +317,12 @@ static int reg_ofs(int r)
     return -(8 * (r + 1));
 }
 
-/* locals: params..., fp, pc, scratch */
+/* locals: params..., fp, pc, scratch_i32, scratch_f32, scratch_f64 */
 #define W_FP_LOCAL  (wasm_cf->nparams)
 #define W_PC_LOCAL  (wasm_cf->nparams + 1)
 #define W_SCRATCH_LOCAL (wasm_cf->nparams + 2)
+#define W_SCRATCH_F32 (wasm_cf->nparams + 3)
+#define W_SCRATCH_F64 (wasm_cf->nparams + 4)
 
 /* ---------------------------------------------------------------- */
 /* growable arrays */
@@ -409,6 +413,7 @@ static void w_i32_patch(int kind, Sym *sym)
         w_i32_const_patch_slot_dummy(kind, sym);
         return;
     }
+
     w_ins(W_I32_CONST);
     slot = ind;
     for (i = 0; i < 4; i++)
@@ -419,6 +424,11 @@ static void w_i32_patch(int kind, Sym *sym)
     wasm_cf->patches[wasm_cf->npatches].ofs = slot;
     wasm_cf->patches[wasm_cf->npatches].sym = sym;
     wasm_cf->patches[wasm_cf->npatches].kind = kind;
+    if (kind == 1 && sym && sym->c) {
+        ElfSym *es = elfsym(sym);
+        wasm_cf->patches[wasm_cf->npatches].dsec = es->st_shndx;
+        wasm_cf->patches[wasm_cf->npatches].dofs = es->st_value;
+    }
     wasm_cf->npatches++;
 }
 
@@ -520,9 +530,12 @@ static void w_emit_slot_load(int r, int bt)
    value in a scratch local, push the address, then reload it. */
 static void w_emit_slot_store(int r, int bt)
 {
-    w_local_set(W_SCRATCH_LOCAL);
+    int scr = (bt == VT_FLOAT) ? W_SCRATCH_F32
+            : (bt == VT_DOUBLE) ? W_SCRATCH_F64
+            : W_SCRATCH_LOCAL;
+    w_local_set(scr);
     w_emit_slot_addr(r);
-    w_local_get(W_SCRATCH_LOCAL);
+    w_local_get(scr);
     switch (bt) {
     case VT_FLOAT:  w_store(W_F32_STORE, 4, 2, 0); break;
     case VT_DOUBLE: w_store(W_F64_STORE, 8, 3, 0); break;
@@ -949,7 +962,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     w_sig_from_type(func_type, &w_func_sig, &nwasmparams);
     wasm_cf->sig = w_func_sig;
     wasm_cf->nparams = nwasmparams;
-    wasm_cf->nlocals = 3;   /* fp, pc, scratch */
+    wasm_cf->nlocals = 5;   /* fp, pc, scratch_i32/f32/f64 */
     wasm_cf->has_sret = ((func_type->ref->type.t & VT_BTYPE) == VT_STRUCT);
     {
         int ref = w_func_defined(func_sym, w_func_sig);
@@ -962,16 +975,18 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     ind = 0;
     w_open_seg();
 
-    /* prolog: sp -= frame; fp = sp */
+    /* prolog: fp = sp (frame TOP); sp = fp - frame (frame BOTTOM).
+       Locals live at negative offsets from fp, i.e. INSIDE the frame,
+       so a callee's frame (allocated below our sp) never collides. */
     w_global_get();
+    w_local_tee(W_FP_LOCAL);                /* fp = sp */
     w_ins(W_I32_CONST);
     w_frame_patch = ind;
     for (i = 0; i < 4; i++)
         g(0x80);
     g(0x00);   /* 5-byte slot */
     w_ins(W_I32_SUB);
-    w_local_tee(wasm_cf->nparams);          /* fp */
-    w_global_set();
+    w_global_set();                         /* sp = fp - frame */
 
     /* sret param (if any): store to func_vc */
     if (wasm_cf->has_sret) {
@@ -1047,6 +1062,9 @@ ST_FUNC void gfunc_epilog(void)
     /* return value (if any) from the return slot, then the term edge;
        the whole function body is laid out by w_layout() */
     int ret_bt = w_ret_bt, frame, slot, v, b, i;
+    /* pop the frame: sp = fp */
+    w_local_get(W_FP_LOCAL);
+    w_global_set();
     if (ret_bt != VT_VOID) {
         int reg = (ret_bt == VT_FLOAT || ret_bt == VT_DOUBLE)
                   ? REG_FRET : REG_IRET;
@@ -1407,11 +1425,14 @@ ST_FUNC void gen_opf(int op)
         default: tcc_error("wasm: float cmp %s", get_tok_str(op, NULL)); return;
         }
         w_ins(cmp);
-        /* store 0/1 into an int slot; keep the pair for VT_CMP */
+        /* store 0/1 into an int slot and leave it as a plain register
+           value: tccgen's gvtst will convert it to VT_CMP against an
+           actual zero constant (we have no zero register, so a
+           deferred cmp_r = d|0<<8 would read slot 0 = REG_IRET) */
         d = get_reg(RC_INT);
         w_emit_slot_store(d, VT_INT);
-        vset_VT_CMP(TOK_NE);
-        vtop[0].cmp_r = d | (0 << 8);
+        vtop[0].r = d;
+        vtop[0].type.t = VT_INT;
         return;
     }
     d = get_reg(RC_FLOAT);
@@ -1544,6 +1565,9 @@ ST_FUNC void gfunc_call(int nb_args)
         int r = w_func_ref(sym);
         wasm_funcs[r].sig = sig;
     }
+    /* spill live register values (e.g. a previous call's result in the
+       shared return slot) so the callee can clobber them */
+    save_regs(nb_args + 1);
 
     slots = tcc_malloc(nb_args * sizeof(int));
     /* materialize args into slots (reverse order: bring each arg to
@@ -1724,7 +1748,11 @@ static void w_layout(void)
                 pos = p;
                 si++;
             }
-            if (pos < segend) {
+            if (pos < segend ||
+                (pos == segend && wasm_cf->segs[seg].edge >= 0)) {
+                /* include empty segments that carry an edge (e.g. the
+                   edge-only segment of a plain gjmp) so their jump is
+                   not lost */
                 WSub *s = &subs[nsubs - 1];
                 s->parts = wa_grow(s->parts, &s->part_alloc,
                                    s->nparts + 1, sizeof(WPart));
@@ -1937,18 +1965,14 @@ static int w_sig_typeidx_of(int sig)
 /* section pointers must survive to output time (tcc_state is unset there) */
 static Section *w_sec_data, *w_sec_rodata, *w_sec_bss;
 
-static int w_data_addr_of(Sym *sym)
+static int w_data_addr_of(int dsec, int dofs)
 {
-    ElfSym *es;
     int base = 0;
-    if (!sym || !sym->c)
-        return 0;
-    es = elfsym(sym);
-    if (es->st_shndx == w_sec_rodata->sh_num)
+    if (dsec == w_sec_rodata->sh_num)
         base = w_sec_data->data_offset;
-    else if (es->st_shndx == w_sec_bss->sh_num)
+    else if (dsec == w_sec_bss->sh_num)
         base = w_sec_data->data_offset + w_sec_rodata->data_offset;
-    return base + (int)es->st_value;
+    return base + dofs;
 }
 
 typedef struct WOut {
@@ -2167,7 +2191,7 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                         else
                             tcc_error("wasm: undefined function");
                     } else if (p->kind == 1) {
-                        v = w_data_addr_of(p->sym);
+                        v = w_data_addr_of(p->dsec, p->dofs);
                     }
                     if (p->ofs + 5 <= wf->flen) {
                         int slot = p->ofs, t;
@@ -2179,8 +2203,12 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                         }
                     }
                 }
-                wo_leb(&sec, wf->flen + 3);
-                wo_b(&sec, 0x01); wo_b(&sec, 0x03); wo_b(&sec, VAL_I32);
+                /* locals: 3x i32 (fp, pc, scratch_i32), 1x f32, 1x f64 */
+                wo_leb(&sec, wf->flen + 7);
+                wo_b(&sec, 0x03);           /* 3 groups */
+                wo_b(&sec, 0x03); wo_b(&sec, VAL_I32);
+                wo_b(&sec, 0x01); wo_b(&sec, VAL_F32);
+                wo_b(&sec, 0x01); wo_b(&sec, VAL_F64);
                 for (j = 0; j < wf->flen; j++)
                     wo_b(&sec, wf->final[j]);
             }
