@@ -73,6 +73,7 @@ ST_DATA const char * const target_machine_defs =
     "__wasm\0"
     "__wasm32\0"
     "__wasm32__ 1\0"
+    "__wasi__ 1\0"
     ;
 
 /* "registers" are shadow-memory slots; every slot is usable for
@@ -258,10 +259,18 @@ typedef struct WasmFuncRef {
 typedef struct WasmPatch {
     int ofs;             /* offset in the function body */
     Sym *sym;            /* referenced symbol (NULL for frame-size) */
+    char *name;          /* C function name, strdup'd at patch time
+                            (get_tok_str is unsafe at output time) */
     int kind;            /* 0 = function index, 1 = data address */
     int dsec, dofs;      /* data symbol: section index + offset (kind 1),
                             captured at patch time (sym->c is not stable) */
+    int sig;             /* call signature (kind 0; per-call for varargs) */
 } WasmPatch;
+
+typedef struct WasmImport {
+    char *name;          /* C symbol name (emitted as env."$"+name) */
+    int sig;
+} WasmImport;
 
 /* per-function state */
 typedef struct WasmSeg { int start, end, edge; } WasmSeg;
@@ -293,6 +302,7 @@ typedef struct WasmFunc {
 
 static WasmSig *wasm_sigs;   static int wasm_nsigs, wasm_sig_alloc;
 static WasmFuncRef *wasm_funcs; static int wasm_nfuncs, wasm_func_alloc;
+static WasmImport *wasm_imports; static int wasm_nimports, wasm_import_alloc;
 static WasmFunc *wasm_cf;    /* current function */
 static WasmFunc **wasm_func_list = NULL;
 static int wasm_nfunc_list = 0, wasm_func_list_alloc = 0;
@@ -449,7 +459,7 @@ static void w_local_tee(int i) { w_ins(W_LOCAL_TEE); w_u32(i); }
 static void w_global_get(void) { w_ins(W_GLOBAL_GET); w_u32(0); }
 static void w_global_set(void) { w_ins(W_GLOBAL_SET); w_u32(0); }
 
-static void w_call(Sym *sym)
+static void w_call(Sym *sym, int sig)
 {
     /* call with a 5-byte patchable function index */
     int i, slot;
@@ -465,7 +475,9 @@ static void w_call(Sym *sym)
                                wasm_cf->npatches + 1, sizeof(WasmPatch));
     wasm_cf->patches[wasm_cf->npatches].ofs = slot;
     wasm_cf->patches[wasm_cf->npatches].sym = sym;
+    wasm_cf->patches[wasm_cf->npatches].name = sym ? tcc_strdup(get_tok_str(sym->v, NULL)) : NULL;
     wasm_cf->patches[wasm_cf->npatches].kind = 0;
+    wasm_cf->patches[wasm_cf->npatches].sig = sig;
     wasm_cf->npatches++;
 }
 
@@ -932,9 +944,9 @@ static void w_sig_from_type(CType *func_type, int *psig, int *pnparams)
             params[n++] = w_typeof(&s->type);
         }
     }
-    (void)variadic;
-    if (variadic)
-        tcc_error("wasm: varargs not supported yet");
+    (void)variadic;   /* ellipsis: the signature carries the fixed params
+                         only — the per-call varargs are added by
+                         w_call_sig() at the call site */
     res = w_typeof(&func_type->ref->type);
     nres = ((func_type->ref->type.t & VT_BTYPE) == VT_VOID) ? 0 : 1;
     *pnparams = n;
@@ -1537,6 +1549,68 @@ ST_FUNC void gen_cvt_sxtw(void)
     tcc_error("wasm: sxtw unused");
 }
 
+/* register an env import (name, sig); one entry per distinct pair */
+static int w_import_get(const char *name, int sig)
+{
+    int i;
+    for (i = 0; i < wasm_nimports; i++)
+        if (wasm_imports[i].sig == sig &&
+            !strcmp(wasm_imports[i].name, name))
+            return i;
+    wasm_imports = wa_grow(wasm_imports, &wasm_import_alloc,
+                           wasm_nimports + 1, sizeof(WasmImport));
+    wasm_imports[wasm_nimports].name = tcc_strdup(name);
+    wasm_imports[wasm_nimports].sig = sig;
+    return wasm_nimports++;
+}
+
+/* signature for a call: declared fixed params plus, for variadic
+   functions, this call's actual (promoted) vararg types.  Default
+   promotions (float→double etc.) are applied by the frontend
+   (gfunc_param_typed) before we get here. */
+static int w_call_sig(CType *ft, int nb_args, int *pnparams, int *pvariadic)
+{
+    Sym *s;
+    unsigned char params[64];
+    int n = 0, res, nres, variadic;
+    int n_fixed = 0, i;
+
+    variadic = (ft->ref->f.func_type == FUNC_ELLIPSIS ||
+                ft->ref->f.func_type == FUNC_OLD);
+    if ((ft->ref->type.t & VT_BTYPE) == VT_STRUCT)
+        params[n++] = VAL_I32;   /* sret pointer */
+    for (s = ft->ref->next; s; s = s->next) {
+        if (n >= 60)
+            tcc_error("wasm: too many params");
+        if ((s->type.t & VT_BTYPE) == VT_STRUCT)
+            params[n++] = VAL_I32;   /* by-pointer (v1: caller copies) */
+        else
+            params[n++] = w_typeof(&s->type);
+        n_fixed++;
+    }
+    if (variadic) {
+        for (i = n_fixed; i < nb_args; i++) {
+            SValue *sv = &vtop[1 + i - nb_args];
+            int bt = sv->type.t & VT_BTYPE;
+            if (n >= 60)
+                tcc_error("wasm: too many params");
+            if (bt == VT_STRUCT)
+                tcc_error("wasm: struct vararg unsupported");
+            if (bt == VT_LLONG)
+                tcc_error("wasm: i64 vararg unsupported");
+            if (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE)
+                params[n++] = VAL_F64;
+            else
+                params[n++] = VAL_I32;
+        }
+    }
+    res = w_typeof(&ft->ref->type);
+    nres = ((ft->ref->type.t & VT_BTYPE) == VT_VOID) ? 0 : 1;
+    *pnparams = n;
+    *pvariadic = variadic;
+    return w_sig_get(n, params, nres, res);
+}
+
 /* ---------------------------------------------------------------- */
 /* calls */
 
@@ -1549,11 +1623,11 @@ ST_FUNC void gcall_or_jmp(int docall)
 
 ST_FUNC void gfunc_call(int nb_args)
 {
-    int i, r, rt, ret_bt, res_slot;
+    int i, rt, ret_bt, res_slot;
     int *slots;
     CType *ft;
     Sym *sym;
-    int sig, nparams;
+    int sig, nparams, variadic;
 
     ft = &vtop[-nb_args].type;
     sym = vtop[-nb_args].sym;
@@ -1561,11 +1635,12 @@ ST_FUNC void gfunc_call(int nb_args)
                 (VT_CONST | VT_SYM)) {
         tcc_error("wasm: indirect call (function pointer) unsupported");
     }
-    w_sig_from_type(ft, &sig, &nparams);
-    {
-        int r = w_func_ref(sym);
-        wasm_funcs[r].sig = sig;
-    }
+    sig = w_call_sig(ft, nb_args, &nparams, &variadic);
+    /* Register the env import (name, sig).  Variadic calls get one import
+       per distinct signature — wasm allows same-name imports with
+       different types, and the shell's JS runtime takes (...args).
+       Functions defined later in this TU shadow the import at output. */
+    w_import_get(get_tok_str(sym->v, NULL), sig);
     /* spill live register values (e.g. a previous call's result in the
        shared return slot) so the callee can clobber them */
     save_regs(nb_args + 1);
@@ -1592,9 +1667,11 @@ ST_FUNC void gfunc_call(int nb_args)
     for (i = 0; i < nb_args; i++) {
         SValue *sv = &vtop[1 + i - nb_args];
         int bt = sv->type.t & VT_BTYPE;
+        if (bt == VT_LLONG)
+            tcc_error("wasm: i64 arg unsupported");
         w_emit_slot_load(slots[i], (bt == VT_FLOAT || bt == VT_DOUBLE) ? bt : VT_INT);
     }
-    w_call(sym);
+    w_call(sym, sig);
     /* store the result */
     if (ret_bt == VT_VOID) {
         /* nothing on the stack */
@@ -2028,12 +2105,21 @@ static void wo_sec(WOut *o, int id, WOut *p)
         wo_b(o, p->data[i]);
 }
 
+static void add_used(int *used, int *pnused, int s)
+{
+    int m;
+    for (m = 0; m < *pnused; m++)
+        if (used[m] == s)
+            return;
+    used[(*pnused)++] = s;
+}
+
 ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
 {
     WOut out = {0}, sec = {0};
     FILE *f;
     int i, j, nimports, npages, data_end, stack_top;
-    int *func_idx;
+    int *func_idx, *imp_idx;
     int main_idx = -1, start_idx = -1;
     int ndef = 0, nused = 0, used[512];
     int sig_fdwrite, sig_procexit, sig_start;
@@ -2049,10 +2135,18 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     w_sec_bss = bss_section;
 
     func_idx = tcc_mallocz(wasm_nfuncs * sizeof(int));
+    imp_idx = tcc_mallocz(wasm_nimports * sizeof(int));
     nimports = 2;
-    for (i = 0; i < wasm_nfuncs; i++)
-        if (wasm_funcs[i].import)
-            func_idx[i] = nimports++;
+    for (i = 0; i < wasm_nimports; i++) {
+        int defined = 0;
+        for (k = 0; k < wasm_nfuncs; k++)
+            if (wasm_funcs[k].defined &&
+                !strcmp(wasm_funcs[k].name, wasm_imports[i].name)) {
+                defined = 1;
+                break;
+            }
+        imp_idx[i] = defined ? -1 : nimports++;
+    }
     for (i = 0; i < wasm_nfuncs; i++) {
         if (wasm_funcs[i].defined) {
             func_idx[i] = nimports + wasm_funcs[i].order;
@@ -2067,22 +2161,15 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     /* ---- type section ---- */
     wo_init(&sec);
     nused = 0;
-    {
-        int m;
-        int add_used(int s) {
-            for (m = 0; m < nused; m++)
-                if (used[m] == s)
-                    return;
-            used[nused++] = s;
-        }
-        for (i = 0; i < wasm_nfuncs; i++)
-            if (wasm_funcs[i].sig >= 0)
-                add_used(wasm_funcs[i].sig);
-        if (main_idx >= 0)
-            add_used(sig_start);
-        add_used(sig_fdwrite);
-        add_used(sig_procexit);
-    }
+    for (i = 0; i < wasm_nfuncs; i++)
+        if (wasm_funcs[i].sig >= 0)
+            add_used(used, &nused, wasm_funcs[i].sig);
+    for (i = 0; i < wasm_nimports; i++)
+        add_used(used, &nused, wasm_imports[i].sig);
+    if (main_idx >= 0)
+        add_used(used, &nused, sig_start);
+    add_used(used, &nused, sig_fdwrite);
+    add_used(used, &nused, sig_procexit);
     wo_leb(&sec, nused);
     for (k = 0; k < nused; k++) {
         WasmSig *sg = &wasm_sigs[used[k]];
@@ -2114,12 +2201,16 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     wo_str(&sec, "wasi_snapshot_preview1");
     wo_str(&sec, "proc_exit");
     wo_b(&sec, 0); wo_leb(&sec, w_sig_typeidx_of(sig_procexit));
-    for (i = 0; i < wasm_nfuncs; i++) {
-        if (wasm_funcs[i].import) {
+    for (i = 0; i < wasm_nimports; i++) {
+        if (imp_idx[i] < 0)
+            continue;   /* defined in this module — no import */
+        {
+            char nm[300];
+            snprintf(nm, sizeof nm, "$%s", wasm_imports[i].name);
             wo_str(&sec, "env");
-            wo_str(&sec, wasm_funcs[i].name);
+            wo_str(&sec, nm);
             wo_b(&sec, 0);
-            wo_leb(&sec, w_sig_typeidx_of(wasm_funcs[i].sig));
+            wo_leb(&sec, w_sig_typeidx_of(wasm_imports[i].sig));
         }
     }
     wo_sec(&out, 2, &sec);
@@ -2192,13 +2283,24 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                     WasmPatch *p = &wf->patches[j];
                     int v = 0;
                     if (p->kind == 0 && p->sym) {
+                        const char *nm = p->name;
                         for (k = 0; k < wasm_nfuncs; k++)
-                            if (wasm_funcs[k].sym == p->sym)
+                            if (wasm_funcs[k].defined &&
+                                !strcmp(wasm_funcs[k].name, nm))
                                 break;
                         if (k < wasm_nfuncs)
                             v = func_idx[k];
-                        else
-                            tcc_error("wasm: undefined function");
+                        else {
+                            for (k = 0; k < wasm_nimports; k++)
+                                if (imp_idx[k] >= 0 &&
+                                    wasm_imports[k].sig == p->sig &&
+                                    !strcmp(wasm_imports[k].name, nm))
+                                    break;
+                            if (k < wasm_nimports)
+                                v = imp_idx[k];
+                            else
+                                tcc_error("wasm: undefined function");
+                        }
                     } else if (p->kind == 1) {
                         v = w_data_addr_of(p->dsec, p->dofs);
                     }
@@ -2261,6 +2363,7 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     if (!f) {
         tcc_error_noabort("could not write '%s'", filename);
         tcc_free(func_idx);
+        tcc_free(imp_idx);
         return -1;
     }
     fwrite("\0asm", 1, 4, f);
@@ -2268,6 +2371,7 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     fwrite(out.data, 1, out.len, f);
     fclose(f);
     tcc_free(func_idx);
+    tcc_free(imp_idx);
     return 0;
 }
 

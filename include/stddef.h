@@ -1,12 +1,33 @@
 #ifndef _STDDEF_H
 #define _STDDEF_H
 
+/* Guard each typedef with musl/wasi-libc's __DEFINED_* markers so this
+ * header can coexist with bits/alltypes.h (wasi-libc) in the same TU:
+ * whichever is included first defines the type, the other skips it. */
+#ifndef __DEFINED_size_t
 typedef __SIZE_TYPE__ size_t;
+#define __DEFINED_size_t
+#endif
+#ifndef __DEFINED_ssize_t
 typedef __PTRDIFF_TYPE__ ssize_t;
+#define __DEFINED_ssize_t
+#endif
+#ifndef __DEFINED_wchar_t
 typedef __WCHAR_TYPE__ wchar_t;
+#define __DEFINED_wchar_t
+#endif
+#ifndef __DEFINED_ptrdiff_t
 typedef __PTRDIFF_TYPE__ ptrdiff_t;
+#define __DEFINED_ptrdiff_t
+#endif
+#ifndef __DEFINED_intptr_t
 typedef __PTRDIFF_TYPE__ intptr_t;
+#define __DEFINED_intptr_t
+#endif
+#ifndef __DEFINED_uintptr_t
 typedef __SIZE_TYPE__ uintptr_t;
+#define __DEFINED_uintptr_t
+#endif
 
 #if __STDC_VERSION__ >= 201112L
 typedef union { long long __ll; long double __ld; } max_align_t;
@@ -19,7 +40,11 @@ typedef union { long long __ll; long double __ld; } max_align_t;
 #undef offsetof
 #define offsetof(type, field) __builtin_offsetof(type, field)
 
+/* wasi-libc declares alloca (and redefines it to __builtin_alloca) in
+ * <alloca.h>, pulled in by <stdlib.h> — don't fight it on wasm32. */
+#ifndef __wasm32__
 void *alloca(size_t size);
+#endif
 
 #endif
 
