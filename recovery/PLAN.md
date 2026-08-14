@@ -7,7 +7,7 @@ Status 2026-08-14 (after the fork-destruction incident + recovery commits).
 | Harness | Tests | PASS | failures |
 |---|---|---|---|
 | sh2runtime runner `__tcc-suite-test.mjs` (717KB tcc.wasm) | 130 | 70 | CCERR 36, DIFF 22, RUNERR 2 |
-| fork corpus `tests/wasm-corpus/run-corpus.mjs` (726e659 + recovered fixes to 04cee4d) | 122 | 72 | REFUSE 10, WRONG 10, COMPILE-OUT 17, RUN-CRASH 4, NO-EXPECT 9 |
+| fork corpus `tests/wasm-corpus/run-corpus.mjs` (726e659 + recovered fixes to 581508c) | 122 | 74 | REFUSE 10, WRONG 12, COMPILE-OUT 16, RUN-CRASH 1, NO-EXPECT 9 |
 | fork corpus, LOST state (51 commits, c4655816..3fa1fb6b) | 122 | 110 | reference target |
 
 The runner uses a stale 717KB binary (fork state ~Aug 13 18:56); the fork's
@@ -56,7 +56,18 @@ Legitimate fixes mirroring the fork corpus + upstream tests2/Makefile.
 
 Gate: runner 70 → ~90; no compiler touched.
 
-## Track 1 — Reconstruct the lost fork work (corpus 72 → 110)
+## Track 1 — Reconstruct the lost fork work (corpus 74 → 110)
+
+After 04cee4d: 2acdc84 added signed-LEB pc targets (136_atomic_gcc_style
+passes, RUN-CRASH 4->2); 581508c raised the block split cap to
+W_BLK_SPLITS=128 (88_codeopt passes, RUN-CRASH 2->1; 86_memory-model is
+mostly-valid now — still flaky, an uninitialized read in the w_layout
+sub-building that the final rework eliminated).
+
+Remaining: 03_struct (cleanup-at-exit traps), 78/79/122 (VLA + label
+emit invalid modules), 137 (nested struct-return calls as args),
+118_switch (dispatch off-by-case), 46_grep (regex engine), the 9 fn-ptr
+tests, and computed goto (90/119).
 
 04cee4d added struct by-value args (parking + sp reserve + byref), i64
 args, small struct varargs, const-const float/double loads, and the
