@@ -300,6 +300,11 @@ typedef struct WasmFunc {
     int has_sret;
     int order;           /* body emission order */
     unsigned char *final; int flen;       /* laid-out body */
+    int *sub_starts, *sub_ends; int nsubs_out;  /* position -> sub map
+                                                   (for &&label values) */
+    int *lblpos; int nlblpos, lblpos_alloc;    /* &&label positions in
+                                                  this function (recorded
+                                                  at gsym_addr(0, ind)) */
 } WasmFunc;
 
 static WasmSig *wasm_sigs;   static int wasm_nsigs, wasm_sig_alloc;
@@ -508,7 +513,12 @@ static void w_i32_patch(int kind, Sym *sym)
                                wasm_cf->npatches + 1, sizeof(WasmPatch));
     wasm_cf->patches[wasm_cf->npatches].ofs = slot;
     wasm_cf->patches[wasm_cf->npatches].sym = sym;
+    wasm_cf->patches[wasm_cf->npatches].name =
+        sym ? tcc_strdup(get_tok_str(sym->v, NULL)) : NULL;
     wasm_cf->patches[wasm_cf->npatches].kind = kind;
+    wasm_cf->patches[wasm_cf->npatches].sig = 0;
+    wasm_cf->patches[wasm_cf->npatches].dsec = 0;
+    wasm_cf->patches[wasm_cf->npatches].dofs = 0;
     if (kind == 1 && sym && sym->c) {
         ElfSym *es = elfsym(sym);
         wasm_cf->patches[wasm_cf->npatches].dsec = es->st_shndx;
@@ -1416,6 +1426,18 @@ ST_FUNC void gsym_addr(int t, int a)
 {
     /* resolve the jump chain t to position a; close the current block
        with a fallthrough to the next one (the code continues there) */
+    if (!wasm_cf)
+        return;   /* data-initializer / preprocessor evaluation (the
+                     tccgen's gsym also calls us for the empty chain) */
+    if (t == 0) {
+        /* an address-taken label (&&lbl — the tccgen calls us with an
+           empty chain): record its position so the data-reloc &&label
+           VALUES resolve to THIS function's subs (the code positions
+           are per-function, so the owner must be known) */
+        wasm_cf->lblpos = wa_grow(wasm_cf->lblpos, &wasm_cf->lblpos_alloc,
+                                  wasm_cf->nlblpos + 1, sizeof(int));
+        wasm_cf->lblpos[wasm_cf->nlblpos++] = a;
+    }
     int l = w_new_label();
     wasm_cf->labels[l].pos = a;
     /* a == ind (the usual gsym): the target code follows, in the next
@@ -2177,7 +2199,33 @@ ST_FUNC void gfunc_call(int nb_args)
 
 ST_FUNC void ggoto(void)
 {
-    tcc_error("wasm: computed goto unsupported");
+    /* computed goto (GCC extension): vtop = the label's address
+       (&&lbl).  A CONSTANT label (goto *&&lbl) is a direct pc-set to
+       the label's sub (patched at layout — the label may be defined
+       later); a runtime value (goto *gostring[i]) is dispatched by
+       setting pc to the loaded sub index and branching back to the
+       dispatcher. */
+    if (!wasm_cf)
+        return;
+    if (nocode_wanted & 0xFFFF) {
+        vtop--;
+        return;
+    }
+    if ((vtop->r & VT_VALMASK) == VT_CONST && vtop->sym) {
+        /* constant: the label's sub index is a kind-4 patch (captured
+           to dsec = -2 at layout, when the label's jind is final) */
+        w_i32_patch(4, vtop->sym);
+        vtop--;
+        w_local_set(W_PC_LOCAL);
+    } else {
+        /* runtime: the label value (a sub index) becomes the pc */
+        int r = gv(RC_INT);
+        vtop--;
+        w_emit_slot_load(r, VT_INT);
+        w_local_set(W_PC_LOCAL);
+    }
+    w_add_edge(EDGE_UNCOND, -2, w_new_label());
+    w_new_block();
 }
 
 /* ---------------------------------------------------------------- */
@@ -2291,6 +2339,29 @@ static void w_layout(void)
                     dup = 1;
             if (!dup && c < W_BLK_SPLITS)
                 cnt[b * (W_BLK_SPLITS + 1) + 1 + (cnt[b * (W_BLK_SPLITS + 1)]++)] = pos;
+        }
+    }
+    /* also split at &&label positions: each address-taken label must be
+       a sub boundary so its VALUE (the sub index, the pc dispatch) is
+       resolvable.  The kind-4 patches (goto *&&lbl) carry the label
+       sym; the data/rodata relocs reference labels whose symtab
+       entries land in this function's code range. */
+    {
+        int p2;
+        for (p2 = 0; p2 < wasm_cf->npatches; p2++) {
+            WasmPatch *pp = &wasm_cf->patches[p2];
+            if (pp->kind == 4 && pp->sym && pp->sym->jind > 0) {
+                int pos = pp->sym->jind;
+                if (pos < ind) {
+                    int b = w_block_at_pos(pos);
+                    int c = cnt[b * (W_BLK_SPLITS + 1)], m, dup = 0;
+                    for (m = 0; m < c; m++)
+                        if (cnt[b * (W_BLK_SPLITS + 1) + 1 + m] == pos)
+                            dup = 1;
+                    if (!dup && c < W_BLK_SPLITS)
+                        cnt[b * (W_BLK_SPLITS + 1) + 1 + (cnt[b * (W_BLK_SPLITS + 1)]++)] = pos;
+                }
+            }
         }
     }
     for (i = 0; i < nb; i++) {
@@ -2416,6 +2487,28 @@ static void w_layout(void)
             tcc_error("wasm: internal: unresolved label at %d", pos);
     }
 
+    /* capture the &&label patches: at LAYOUT time the label sym's jind
+       is its final code position (the sym is freed/reused by output
+       time).  The VALUE resolves to the SUB INDEX of the code at that
+       position (the pc dispatch is by sub).  kind-1 patches with a
+       label sym (c == 0 for code-only &&refs, or a text-section
+       symtab entry for address-taken labels). */
+    for (i = 0; i < wasm_cf->npatches; i++) {
+        WasmPatch *pp = &wasm_cf->patches[i];
+        if (pp->kind == 4 && pp->sym && pp->sym->jind > 0) {
+            /* a constant computed goto (goto *&&lbl): the label's
+               position (jind > 0 — strings/data syms never set it) */
+            pp->dofs = pp->sym->jind;
+            pp->dsec = -2;
+        } else if (pp->kind == 1 && pp->sym && pp->sym->jind > 0 &&
+            pp->sym->c > 0 &&
+            pp->sym->c < (int)(symtab_section->data_offset / sizeof(ElfSym)) &&
+            elfsym(pp->sym)->st_shndx == text_section->sh_num) {
+            pp->dofs = pp->sym->jind;
+            pp->dsec = -2;
+        }
+    }
+
     /* 4. emit the final body */    ret_valtype = w_typeof(&func_vt);
     if ((func_vt.t & VT_BTYPE) == VT_VOID)
         ret_valtype = 0;
@@ -2483,6 +2576,18 @@ static void w_layout(void)
                 WasmEdge *ed = &wasm_cf->edges[wasm_cf->segs[seg].edge];
                 int target = ed->label >= 0 ? wasm_cf->labels[ed->label].sub : -1;
                 int v;
+                if (ed->op == -2) {
+                    /* computed goto (ggoto): the pc was ALREADY set to
+                       the runtime label value — just br back to the
+                       dispatcher.  Checked BEFORE the nocode-suppressed
+                       skip: the edge carries a DUMMY label (never
+                       resolved) and the pc-set must not be emitted. */
+                    body = wa_grow(body, &balloc, blen + 4, 1);
+                    body[blen++] = W_BR; body[blen++] = i + 1;
+                    if (k == s->nparts - 1)
+                        last_has_edge = 1;
+                    continue;
+                }
                 if (ed->op == -1) {
                     /* suppressed under nocode_wanted (gjmp/gjmp_cond
                        marked it): the region is dead — emit nothing and
@@ -2561,6 +2666,14 @@ static void w_layout(void)
 
     wasm_cf->final = body;
     wasm_cf->flen = blen;
+    /* position -> sub map (for &&label VALUES: the pc dispatch) */
+    wasm_cf->sub_starts = tcc_malloc(nsubs * sizeof(int));
+    wasm_cf->sub_ends = tcc_malloc(nsubs * sizeof(int));
+    wasm_cf->nsubs_out = nsubs;
+    for (i = 0; i < nsubs; i++) {
+        wasm_cf->sub_starts[i] = subs[i].start;
+        wasm_cf->sub_ends[i] = subs[i].end;
+    }
     for (i = 0; i < nsubs; i++)
         tcc_free(subs[i].parts);
     tcc_free(subs);
@@ -2672,12 +2785,36 @@ static void w_apply_data_relocs(TCCState *s1, Section *sec, unsigned char *out)
         unsigned char *p = out + rel->r_offset;
         char *nm = &((char *)symtab_section->link->data)[es->st_name];
         int v = 0;
-        if (es->st_shndx == text_section->sh_num
-            || es->st_shndx == SHN_ABS
-            || ELFW(ST_TYPE)(es->st_info) == STT_FUNC) {
+        if (ELFW(ST_TYPE)(es->st_info) == STT_FUNC
+            || es->st_shndx == SHN_ABS) {
             /* function address — the table slot */
             int fv = w_fv_find(nm);
             v = (fv >= 0) ? fv + 1 : 0;
+        } else if (es->st_shndx == text_section->sh_num) {
+            /* a &&label: the value is the SUB INDEX of the code at
+               st_value, resolved in the OWNING function (the one that
+               recorded the label position at gsym_addr(0, ind)) — the
+               code positions are per-function, so the owner must be
+               known to avoid false matches) */
+            int f2, r2, found = 0;
+            for (f2 = 0; f2 < wasm_nfuncs && !found; f2++) {
+                WasmFunc *wfl = w_func_by_order(wasm_funcs[f2].order);
+                if (!wfl)
+                    continue;
+                for (r2 = 0; r2 < wfl->nlblpos; r2++)
+                    if (wfl->lblpos[r2] == es->st_value) {
+                        /* owner found — resolve in its sub map */
+                        int r3;
+                        for (r3 = 0; r3 < wfl->nsubs_out; r3++)
+                            if (es->st_value >= wfl->sub_starts[r3] &&
+                                es->st_value < wfl->sub_ends[r3]) {
+                                v = r3;
+                                break;
+                            }
+                        found = 1;
+                        break;
+                    }
+            }
         } else {
             v = w_data_addr_of(es->st_shndx, es->st_value);
         }
@@ -2737,9 +2874,8 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                 int si = ELFW(R_SYM)(rel->r_info);
                 ElfW(Sym) *es = &((ElfW(Sym) *)symtab_section->data)[si];
                 char *nm = &((char *)symtab_section->link->data)[es->st_name];
-                if (es->st_shndx == text_section->sh_num ||
-                    es->st_shndx == SHN_ABS ||
-                    ELFW(ST_TYPE)(es->st_info) == STT_FUNC)
+                if (ELFW(ST_TYPE)(es->st_info) == STT_FUNC ||
+                    es->st_shndx == SHN_ABS)
                     w_fv_slot(nm);
             }
         }
@@ -2995,8 +3131,31 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                             else
                                 tcc_error("wasm: undefined function");
                         }
+                    } else if (p->kind == 4) {
+                        /* a constant computed goto: same as the -2 case */
+                        int rr;
+                        v = 0;
+                        for (rr = 0; rr < wf->nsubs_out; rr++)
+                            if (p->dofs >= wf->sub_starts[rr] &&
+                                p->dofs < wf->sub_ends[rr]) {
+                                v = rr;
+                                break;
+                            }
                     } else if (p->kind == 1) {
-                        v = w_data_addr_of(p->dsec, p->dofs);
+                        if (p->dsec == -2) {
+                            /* a &&label: the sub index of the code at
+                               dofs (the pc dispatch value) */
+                            int rr;
+                            v = 0;
+                            for (rr = 0; rr < wf->nsubs_out; rr++)
+                                if (p->dofs >= wf->sub_starts[rr] &&
+                                    p->dofs < wf->sub_ends[rr]) {
+                                    v = rr;
+                                    break;
+                                }
+                        } else {
+                            v = w_data_addr_of(p->dsec, p->dofs);
+                        }
                     } else if (p->kind == 2 && p->name) {
                         int fv = w_fv_find(p->name);
                         v = (fv >= 0) ? fv + 1 : 0;   /* 1-based table slot */

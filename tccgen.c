@@ -7477,6 +7477,14 @@ again:
 		    for (pcl = s->next; pcl; pcl = pcl->prev)
 		      gsym(pcl->jnext);
 		    sym_pop(&s->next, NULL, 0);
+		} else if ((s->type.t & VT_BTYPE) == VT_PTR) {
+		    /* an address-taken label (&&lbl set the type): the
+		       jnext/c union holds the symtab index, NOT a goto
+		       chain — the backend just needs a block split at the
+		       label's position (so its &&label VALUE is a
+		       dispatchable sub).  Other backends' gsym_addr is a
+		       no-op for an empty chain. */
+		    gsym_addr(0, ind);
 		} else
 		  gsym(s->jnext);
             } else {
