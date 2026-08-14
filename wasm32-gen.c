@@ -334,6 +334,57 @@ static void w_indir_sig(int sig)
     wasm_indir_sigs[wasm_nindir++] = sig;
 }
 
+/* a WEAK function reference (__attribute__((weak)) — the GOT() checks
+   in 104_inline) resolves to 0/NULL: it has no table slot.  A STRONG
+   extern (fprintf in 42) gets a slot. */
+static int w_sym_weak(Sym *sym)
+{
+    ElfSym *es;
+    if (!sym)
+        return 0;
+    /* the weak attribute lives on the Sym (the GOT() refs never got a
+       symtab entry — c == 0) and/or in the symtab binding */
+    if (sym->a.weak)
+        return 1;
+    if (!sym->c)
+        return 0;
+    if (sym->c < 0 ||
+        sym->c >= (int)(symtab_section->data_offset / sizeof(ElfSym)))
+        return 0;
+    es = elfsym(sym);
+    if (!es)
+        return 0;
+    return ELFW(ST_BIND)(es->st_info) == STB_WEAK;
+}
+
+/* a weak reference WITHOUT a local definition resolves to 0/NULL (no
+   table slot); a weak ref that HAS a strong definition in this module
+   resolves to the function (104_inline's extern_* GOT() checks). */
+static int w_sym_weak_undef(Sym *sym, const char *nm)
+{
+    int k;
+    if (!w_sym_weak(sym) || !nm)
+        return 0;
+    for (k = 0; k < wasm_nfuncs; k++)
+        if (wasm_funcs[k].defined && !strcmp(wasm_funcs[k].name, nm)) {
+            /* a local (static) definition is a DIFFERENT symbol than
+               the extern weak ref — no slot (104's static_func prints
+               0); a global (extern) definition resolves the ref.  The
+               syms are freed at output — the symtab (stable) decides */
+            int i;
+            for (i = 0; i < (int)(symtab_section->data_offset / sizeof(ElfSym)); i++) {
+                ElfSym *es = &((ElfSym *)symtab_section->data)[i];
+                char *en = &((char *)symtab_section->link->data)[es->st_name];
+                if (es->st_shndx == text_section->sh_num &&
+                    ELFW(ST_TYPE)(es->st_info) == STT_FUNC &&
+                    !strcmp(en, nm))
+                    return ELFW(ST_BIND)(es->st_info) == STB_LOCAL;
+            }
+            return 0;
+        }
+    return 1;
+}
+
 static int w_fv_find(const char *nm)
 {
     int i;
@@ -2909,8 +2960,19 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
             if (!wf)
                 continue;
             for (j = 0; j < wf->npatches; j++)
-                if (wf->patches[j].kind == 2 && wf->patches[j].name)
-                    w_fv_slot(wf->patches[j].name);
+                if (wf->patches[j].kind == 2 && wf->patches[j].name) {
+                    if (getenv("WASM_WK_DBG")) {
+                        Sym *ss = wf->patches[j].sym;
+                        fprintf(stderr, "WK %s sym=%p c=%d bind=%d\n",
+                                wf->patches[j].name, (void*)ss,
+                                ss ? ss->c : -1,
+                                (ss && ss->c > 0 && ss->c < (int)(symtab_section->data_offset/sizeof(ElfSym)))
+                                    ? ELFW(ST_BIND)(elfsym(ss)->st_info) : -1);
+                    }
+                    if (!w_sym_weak_undef(wf->patches[j].sym,
+                                           wf->patches[j].name))
+                        w_fv_slot(wf->patches[j].name);
+                }
         }
     }
     for (i = 0; i < wasm_ndtors; i++)
@@ -2969,7 +3031,8 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                 int si = ELFW(R_SYM)(rel->r_info);
                 ElfW(Sym) *es = &((ElfW(Sym) *)symtab_section->data)[si];
                 if (es->st_shndx != SHN_UNDEF ||
-                    ELFW(ST_TYPE)(es->st_info) != STT_FUNC)
+                    ELFW(ST_TYPE)(es->st_info) != STT_FUNC ||
+                    ELFW(ST_BIND)(es->st_info) == STB_WEAK)
                     continue;
                 want = wa_grow(want, &walloc, nwant + 1, sizeof(char *));
                 want[nwant++] = &((char *)symtab_section->link->data)[es->st_name];
@@ -2981,7 +3044,9 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
             if (!wf)
                 continue;
             for (j = 0; j < wf->npatches; j++)
-                if (wf->patches[j].kind == 2 && wf->patches[j].name) {
+                if (wf->patches[j].kind == 2 && wf->patches[j].name &&
+                    !w_sym_weak_undef(wf->patches[j].sym,
+                                      wf->patches[j].name)) {
                     int isdef = 0;
                     for (k = 0; k < wasm_nfuncs; k++)
                         if (wasm_funcs[k].defined &&
@@ -3296,8 +3361,14 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                             v = w_data_addr_of(p->dsec, p->dofs);
                         }
                     } else if (p->kind == 2 && p->name) {
-                        int fv = w_fv_find(p->name);
-                        v = (fv >= 0) ? fv + 1 : 0;   /* 1-based table slot */
+                        if (w_sym_weak_undef(p->sym, p->name)) {
+                            /* a weak reference (GOT(): the inline/static
+                               functions have no address) — NULL */
+                            v = 0;
+                        } else {
+                            int fv = w_fv_find(p->name);
+                            v = (fv >= 0) ? fv + 1 : 0;  /* 1-based slot */
+                        }
                     } else if (p->kind == 3) {
                         v = w_sig_typeidx_of(p->sig); /* call_indirect type */
                     }
