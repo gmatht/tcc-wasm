@@ -899,6 +899,8 @@ ST_FUNC void load(int r, SValue *sv)
     if (v == VT_CONST) {
         if (sv->r & VT_SYM) {
             w_i32_patch(1, sv->sym);
+            if (fc)
+                w_i32_const(fc), w_ins(W_I32_ADD);   /* member offset */
             w_emit_slot_store(r, VT_INT);
         } else if (bt == VT_FLOAT) {
             union { float f; unsigned u; } u;
