@@ -2886,6 +2886,86 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     w_sec_rodata = rodata_section;
     w_sec_bss = bss_section;
 
+    /* pre-pass: extern functions referenced only by address (fn-ptr
+       initializers like int (*fp)(...) = &extern_fn, or &sprintf passed
+       as an argument) must be env imports so they have a function
+       index — the call_indirect table entry needs one.  The signature
+       is the LAST indirect-call signature: the extern's call was the
+       most recent call_indirect to register its per-call sig (variadic
+       calls include the actual varargs). */
+    {
+        /* collect the extern fn-ptr names: data/rodata relocs (global
+           fn-ptr initializers, &extern_fn) + kind-2 patches (a fn
+           address passed as an argument in code).  Each gets an env
+           import (the call_indirect table entry needs a function
+           index).  The signature is the LAST indirect-call signature:
+           the extern's call was the most recent call_indirect to
+           register its per-call sig (variadic calls include the actual
+           varargs). */
+        char **want = NULL; int nwant = 0, walloc = 0;
+        Section *sr;
+        int secs[2]; secs[0] = data_section->sh_num; secs[1] = rodata_section->sh_num;
+        for (k = 0; k < 2; k++) {
+            sr = (secs[k] == data_section->sh_num) ? data_section->reloc
+                                                   : rodata_section->reloc;
+            if (!sr)
+                continue;
+            for (i = 0; i < (int)(sr->data_offset / sizeof(ElfW_Rel)); i++) {
+                ElfW_Rel *rel = &((ElfW_Rel *)sr->data)[i];
+                int si = ELFW(R_SYM)(rel->r_info);
+                ElfW(Sym) *es = &((ElfW(Sym) *)symtab_section->data)[si];
+                if (es->st_shndx != SHN_UNDEF ||
+                    ELFW(ST_TYPE)(es->st_info) != STT_FUNC)
+                    continue;
+                want = wa_grow(want, &walloc, nwant + 1, sizeof(char *));
+                want[nwant++] = &((char *)symtab_section->link->data)[es->st_name];
+            }
+        }
+        for (i = 0; i < wasm_nfuncs; i++) {
+            WasmFunc *wf = wasm_funcs[i].defined
+                           ? w_func_by_order(wasm_funcs[i].order) : NULL;
+            if (!wf)
+                continue;
+            for (j = 0; j < wf->npatches; j++)
+                if (wf->patches[j].kind == 2 && wf->patches[j].name) {
+                    int isdef = 0;
+                    for (k = 0; k < wasm_nfuncs; k++)
+                        if (wasm_funcs[k].defined &&
+                            !strcmp(wasm_funcs[k].name, wf->patches[j].name)) {
+                            isdef = 1;
+                            break;
+                        }
+                    if (!isdef) {
+                        want = wa_grow(want, &walloc, nwant + 1, sizeof(char *));
+                        want[nwant++] = wf->patches[j].name;
+                    }
+                }
+        }
+        for (i = 0; i < nwant; i++) {
+            const char *nm = want[i];
+            int found = 0, q2;
+            for (q2 = 0; q2 < wasm_nimports; q2++)
+                if (!strcmp(wasm_imports[q2].name, nm)) {
+                    found = 1;
+                    break;
+                }
+            if (found)
+                continue;
+            /* the extern's table slot (its fv index) is popped by ITS
+               call_indirect — the sigs register in call order, so the
+               extern's fv index maps to its call's per-call sig */
+            int fvi = w_fv_find(nm);
+            int sig = 0;
+            if (wasm_nindir > 0) {
+                if (fvi >= 0 && fvi < wasm_nindir)
+                    sig = wasm_indir_sigs[fvi];
+                else
+                    sig = wasm_indir_sigs[wasm_nindir - 1];
+            }
+            w_import_get(nm, sig);
+        }
+    }
+
     func_idx = tcc_mallocz(wasm_nfuncs * sizeof(int));
     imp_idx = tcc_mallocz(wasm_nimports * sizeof(int));
     nimports = 2;
@@ -3000,11 +3080,11 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
             rodata_section ? (int)rodata_section->data_offset : -1,
     data_end = (data_section->data_offset + rodata_section->data_offset
                 + bss_section->data_offset + 15) & ~15;
-    /* the stack grows down from the top of memory: the 128KB headroom
-       is enough for ordinary tests, but 119_random_stuff's 256KB struct
-       by-value copies park ~1MB below sp — give the memory a full MB
-       of stack headroom so those fit */
-    npages = (data_end + 0x100000 + 0xffff) >> 16;
+    /* the stack grows down from the top of memory; the frame grows UP
+       from sp (locals at fp+offset).  119_random_stuff's 256KB struct
+       by-value copies park ~1MB below sp AND its frame sits ~720KB
+       above it — give the memory 2MB total headroom so both fit */
+    npages = (data_end + 0x200000 + 0xffff) >> 16;
     if (npages < 16)
         npages = 16;
     wo_init(&sec);
@@ -3084,9 +3164,14 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                 }
             if (fi < 0) {
                 /* an extern function (env import) — the table needs a
-                   function index; imports precede defined funcs */
+                   function index; imports precede defined funcs.  The
+                   import's sig must match the call that pops this slot
+                   (the fv-index -> indir-sig mapping: sigs register in
+                   call order). */
+                int want_sig = (i < wasm_nindir) ? wasm_indir_sigs[i] : -1;
                 for (k = 0; k < wasm_nimports; k++)
                     if (imp_idx[k] >= 0 &&
+                        (want_sig < 0 || wasm_imports[k].sig == want_sig) &&
                         !strcmp(wasm_imports[k].name, wasm_fv[i])) {
                         fi = imp_idx[k];
                         break;
