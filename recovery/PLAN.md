@@ -7,7 +7,7 @@ Status 2026-08-14 (after the fork-destruction incident + recovery commits).
 | Harness | Tests | PASS | failures |
 |---|---|---|---|
 | sh2runtime runner `__tcc-suite-test.mjs` (717KB tcc.wasm) | 130 | 70 | CCERR 36, DIFF 22, RUNERR 2 |
-| fork corpus `tests/wasm-corpus/run-corpus.mjs` (726e659 + 99e60d8) | 122 | 45 | REFUSE 45, WRONG 10, RUN-CRASH 2, COMPILE-OUT 11, NO-EXPECT 9 |
+| fork corpus `tests/wasm-corpus/run-corpus.mjs` (726e659 + 99e60d8 + 3c7dc89) | 122 | 51 | REFUSE 30, WRONG 13, RUN-CRASH 3, COMPILE-OUT 16, NO-EXPECT 9 |
 | fork corpus, LOST state (51 commits, c4655816..3fa1fb6b) | 122 | 110 | reference target |
 
 The runner uses a stale 717KB binary (fork state ~Aug 13 18:56); the fork's
@@ -56,7 +56,10 @@ Legitimate fixes mirroring the fork corpus + upstream tests2/Makefile.
 
 Gate: runner 70 → ~90; no compiler touched.
 
-## Track 1 — Reconstruct the lost fork work (corpus 45 → 110)
+## Track 1 — Reconstruct the lost fork work (corpus 51 → 110)
+
+(3c7dc89 already re-applied the self-contained 13a/13b edits: _start
+argv, fn-ptr slot machinery, VLA hooks, memory headroom, patch fields.)
 
 Use the replay kit (`recovery/replay_engine.py` + `recovery/fork-ops.json`
 from the pi session transcripts).  The engine replays ~470 ops but does not
