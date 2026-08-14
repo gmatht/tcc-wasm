@@ -267,6 +267,8 @@ typedef struct WasmPatch {
     int dsec, dofs;      /* data symbol: section index + offset (kind 1),
                             captured at patch time (sym->c is not stable) */
     int sig;             /* call signature (kind 0; per-call for varargs) */
+    int is_asm;          /* the sym had an __asm__ name (captured at patch
+                            time — the sym is freed before output) */
 } WasmPatch;
 
 typedef struct WasmImport {
@@ -582,6 +584,7 @@ static void w_i32_patch(int kind, Sym *sym)
     wasm_cf->patches[wasm_cf->npatches].sig = 0;
     wasm_cf->patches[wasm_cf->npatches].dsec = 0;
     wasm_cf->patches[wasm_cf->npatches].dofs = 0;
+    wasm_cf->patches[wasm_cf->npatches].is_asm = sym && sym->asm_label;
     if (kind == 1 && sym && sym->c) {
         ElfSym *es = elfsym(sym);
         wasm_cf->patches[wasm_cf->npatches].dsec = es->st_shndx;
@@ -626,6 +629,7 @@ static void w_call(Sym *sym, int sig)
     wasm_cf->patches[wasm_cf->npatches].name = sym ? tcc_strdup(w_sym_name(sym)) : NULL;
     wasm_cf->patches[wasm_cf->npatches].kind = 0;
     wasm_cf->patches[wasm_cf->npatches].sig = sig;
+    wasm_cf->patches[wasm_cf->npatches].is_asm = sym && sym->asm_label;
     wasm_cf->npatches++;
 }
 
@@ -2065,6 +2069,7 @@ ST_FUNC void gfunc_call(int nb_args)
             wasm_cf->patches[wasm_cf->npatches].name = NULL;
             wasm_cf->patches[wasm_cf->npatches].kind = 3;  /* indir typeidx */
             wasm_cf->patches[wasm_cf->npatches].sig = sig;
+            wasm_cf->patches[wasm_cf->npatches].is_asm = 0;
             wasm_cf->npatches++;
         }
         w_u32(0);                             /* table 0 */
@@ -3337,15 +3342,59 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                         if (k < wasm_nfuncs)
                             v = func_idx[k];
                         else {
-                            for (k = 0; k < wasm_nimports; k++)
-                                if (imp_idx[k] >= 0 &&
-                                    wasm_imports[k].sig == p->sig &&
-                                    !strcmp(wasm_imports[k].name, nm))
+                            /* an __attribute__((alias)) reference: the
+                               alias has no body — its symtab entry
+                               (text, STT_FUNC) carries the TARGET's
+                               st_value; find the defined function at
+                               that value (120_alias's alias_for_target
+                               must call target) */
+                            int s2, av = -1;
+                            for (s2 = 0;
+                                 s2 < (int)(symtab_section->data_offset / sizeof(ElfSym));
+                                 s2++) {
+                                ElfSym *es2 = &((ElfSym *)symtab_section->data)[s2];
+                                char *en2 = &((char *)symtab_section->link->data)[es2->st_name];
+                                if (es2->st_shndx == text_section->sh_num &&
+                                    ELFW(ST_TYPE)(es2->st_info) == STT_FUNC &&
+                                    !strcmp(en2, nm)) {
+                                    av = es2->st_value;
                                     break;
-                            if (k < wasm_nimports)
-                                v = imp_idx[k];
-                            else
-                                tcc_error("wasm: undefined function");
+                                }
+                            }
+                            if (av >= 0) {
+                                for (k = 0; k < wasm_nfuncs; k++)
+                                    if (wasm_funcs[k].defined) {
+                                        int s3, match = 0;
+                                        for (s3 = 0;
+                                             s3 < (int)(symtab_section->data_offset / sizeof(ElfSym));
+                                             s3++) {
+                                            ElfSym *es3 = &((ElfSym *)symtab_section->data)[s3];
+                                            char *en3 = &((char *)symtab_section->link->data)[es3->st_name];
+                                            if (es3->st_shndx == text_section->sh_num &&
+                                                ELFW(ST_TYPE)(es3->st_info) == STT_FUNC &&
+                                                !strcmp(en3, wasm_funcs[k].name) &&
+                                                es3->st_value == av) {
+                                                match = 1;
+                                                break;
+                                            }
+                                        }
+                                        if (match) {
+                                            v = func_idx[k];
+                                            break;
+                                        }
+                                    }
+                            }
+                            if (v == 0) {
+                                for (k = 0; k < wasm_nimports; k++)
+                                    if (imp_idx[k] >= 0 &&
+                                        wasm_imports[k].sig == p->sig &&
+                                        !strcmp(wasm_imports[k].name, nm))
+                                        break;
+                                if (k < wasm_nimports)
+                                    v = imp_idx[k];
+                                else
+                                    tcc_error("wasm: undefined function");
+                            }
                         }
                     } else if (p->kind == 4) {
                         /* a constant computed goto: same as the -2 case */
@@ -3358,7 +3407,25 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                                 break;
                             }
                     } else if (p->kind == 1) {
-                        if (p->dsec == -2) {
+                        if (p->is_asm && p->name) {
+                            /* an __asm__-renamed global (int asm_int
+                               __asm__("g_int")): the frontend gives it
+                               its own bss placeholder — resolve by the
+                               asm name to the DEFINED symbol */
+                            int s2;
+                            v = 0;
+                            for (s2 = 0;
+                                 s2 < (int)(symtab_section->data_offset / sizeof(ElfSym));
+                                 s2++) {
+                                ElfSym *es2 = &((ElfSym *)symtab_section->data)[s2];
+                                char *en2 = &((char *)symtab_section->link->data)[es2->st_name];
+                                if (es2->st_shndx != SHN_UNDEF &&
+                                    !strcmp(en2, p->name)) {
+                                    v = w_data_addr_of(es2->st_shndx, es2->st_value);
+                                    break;
+                                }
+                            }
+                        } else if (p->dsec == -2) {
                             /* a &&label: the sub index of the code at
                                dofs (the pc dispatch value) */
                             int rr;
