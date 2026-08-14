@@ -828,14 +828,16 @@ ST_FUNC void load(int r, SValue *sv)
            several segments start at one position) */
         wasm_cf->labels[l_false].pos = ind;
         wasm_cf->labels[l_false].seg = -1;   /* pos-containment only */
-        /* l_false block: r = !inv */
-        w_i32_const(inv ^ 1);
+        /* l_false block: r = inv (the chain did NOT jump — the value
+           is the non-inverted test result) */
+        w_i32_const(inv);
         w_emit_slot_store(r, VT_INT);
         w_add_edge(EDGE_UNCOND, 0, l_merge);
-        /* l_true block: r = inv */
+        /* l_true block: r = !inv (the chain jumped — the value is the
+           inverted test result) */
         wasm_cf->labels[l_true].pos = ind;
         wasm_cf->labels[l_true].seg = -1;
-        w_i32_const(inv);
+        w_i32_const(inv ^ 1);
         w_emit_slot_store(r, VT_INT);
         w_add_edge(EDGE_UNCOND, 0, l_merge);
         /* merge: the code that follows */
