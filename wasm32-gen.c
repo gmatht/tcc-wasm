@@ -337,6 +337,18 @@ static void w_indir_sig(int sig)
 /* a WEAK function reference (__attribute__((weak)) — the GOT() checks
    in 104_inline) resolves to 0/NULL: it has no table slot.  A STRONG
    extern (fprintf in 42) gets a slot. */
+/* the effective symbol name: an __asm__("z7") renamed extern resolves
+   under its asm name (129_scopes' extern struct xx7 y __asm__("z7")
+   must reach the z7 definition) */
+static const char *w_sym_name(Sym *sym)
+{
+    if (!sym)
+        return NULL;
+    if (sym->asm_label)
+        return get_tok_str(sym->asm_label, NULL);
+    return get_tok_str(sym->v, NULL);
+}
+
 static int w_sym_weak(Sym *sym)
 {
     ElfSym *es;
@@ -565,7 +577,7 @@ static void w_i32_patch(int kind, Sym *sym)
     wasm_cf->patches[wasm_cf->npatches].ofs = slot;
     wasm_cf->patches[wasm_cf->npatches].sym = sym;
     wasm_cf->patches[wasm_cf->npatches].name =
-        sym ? tcc_strdup(get_tok_str(sym->v, NULL)) : NULL;
+        sym ? tcc_strdup(w_sym_name(sym)) : NULL;
     wasm_cf->patches[wasm_cf->npatches].kind = kind;
     wasm_cf->patches[wasm_cf->npatches].sig = 0;
     wasm_cf->patches[wasm_cf->npatches].dsec = 0;
@@ -611,7 +623,7 @@ static void w_call(Sym *sym, int sig)
                                wasm_cf->npatches + 1, sizeof(WasmPatch));
     wasm_cf->patches[wasm_cf->npatches].ofs = slot;
     wasm_cf->patches[wasm_cf->npatches].sym = sym;
-    wasm_cf->patches[wasm_cf->npatches].name = sym ? tcc_strdup(get_tok_str(sym->v, NULL)) : NULL;
+    wasm_cf->patches[wasm_cf->npatches].name = sym ? tcc_strdup(w_sym_name(sym)) : NULL;
     wasm_cf->patches[wasm_cf->npatches].kind = 0;
     wasm_cf->patches[wasm_cf->npatches].sig = sig;
     wasm_cf->npatches++;
@@ -3357,6 +3369,23 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                                     v = rr;
                                     break;
                                 }
+                        } else if (p->dsec == SHN_UNDEF && p->name) {
+                            /* an undefined extern data symbol (incl.
+                               an __asm__-renamed one): resolve to the
+                               DEFINED symbol's data address */
+                            int s2;
+                            v = 0;
+                            for (s2 = 0;
+                                 s2 < (int)(symtab_section->data_offset / sizeof(ElfSym));
+                                 s2++) {
+                                ElfSym *es2 = &((ElfSym *)symtab_section->data)[s2];
+                                char *en2 = &((char *)symtab_section->link->data)[es2->st_name];
+                                if (es2->st_shndx != SHN_UNDEF &&
+                                    !strcmp(en2, p->name)) {
+                                    v = w_data_addr_of(es2->st_shndx, es2->st_value);
+                                    break;
+                                }
+                            }
                         } else {
                             v = w_data_addr_of(p->dsec, p->dofs);
                         }
