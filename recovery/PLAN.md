@@ -7,7 +7,7 @@ Status 2026-08-14 (after the fork-destruction incident + recovery commits).
 | Harness | Tests | PASS | failures |
 |---|---|---|---|
 | sh2runtime runner `__tcc-suite-test.mjs` (717KB tcc.wasm) | 130 | 70 | CCERR 36, DIFF 22, RUNERR 2 |
-| fork corpus `tests/wasm-corpus/run-corpus.mjs` (726e659 + recovered fixes to f5d55ce) | 122 | 64 | REFUSE 21, WRONG 11, COMPILE-OUT 14, RUN-CRASH 3, NO-EXPECT 9 |
+| fork corpus `tests/wasm-corpus/run-corpus.mjs` (726e659 + recovered fixes to 04cee4d) | 122 | 72 | REFUSE 10, WRONG 10, COMPILE-OUT 17, RUN-CRASH 4, NO-EXPECT 9 |
 | fork corpus, LOST state (51 commits, c4655816..3fa1fb6b) | 122 | 110 | reference target |
 
 The runner uses a stale 717KB binary (fork state ~Aug 13 18:56); the fork's
@@ -56,7 +56,14 @@ Legitimate fixes mirroring the fork corpus + upstream tests2/Makefile.
 
 Gate: runner 70 → ~90; no compiler touched.
 
-## Track 1 — Reconstruct the lost fork work (corpus 64 → 110)
+## Track 1 — Reconstruct the lost fork work (corpus 72 → 110)
+
+04cee4d added struct by-value args (parking + sp reserve + byref), i64
+args, small struct varargs, const-const float/double loads, and the
+deferred-compare operand recording: 107/109/110/121/130/131/134/135 +
+17_enum pass.  Known regression: 86_memory-model (all-constant
+sizeof-compare blocks emit after the exit — w_layout segment edge
+case, needs the final VT_JMP/gsym refinements).
 
 Recovered so far (all pushed to origin/mob, each verified zero-regression):
 - 99e60d8: sret, i64 return pair store, code-buffer grow, NULL guards, data base (45)
