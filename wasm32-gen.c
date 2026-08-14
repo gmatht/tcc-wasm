@@ -1274,7 +1274,18 @@ ST_FUNC int gjmp_cond(int op, int t)
     int ins0 = wasm_cf->nins;   /* real (non-suppressed) ops so far */
     /* materialize the comparison: vtop is VT_CMP */
     if (vtop->r == VT_CMP) {
-        w_emit_cmp(op, vtop->cmp_r & 0xff, (vtop->cmp_r >> 8) & 0xff);
+        int ca = vtop->cmp_r & 0xff, cb = (vtop->cmp_r >> 8) & 0xff;
+        if (vtop->cmp_r != w_last_cmp_r) {
+            /* re-marked comparison (see gen_opi): tccgen's 64-bit
+               compare decomposition sets VT_CMP(NE) without cmp_r
+               (x86's flags are the source of truth); use the last
+               recorded operands — otherwise the switch's case ranges
+               compare garbage registers (118_switch matched the wrong
+               range) */
+            ca = w_last_cmp_a;
+            cb = w_last_cmp_b;
+        }
+        w_emit_cmp(op, ca, cb);
     } else {
         /* plain value vs zero */
         int bt = vtop->type.t & VT_BTYPE;
@@ -1409,7 +1420,7 @@ static int w_carry_slot = 7;   /* dedicated slot for add-carry/borrow */
 
 ST_FUNC void gen_opi(int op)
 {
-    int a, b, d, o;
+    int a, b, d, d2, o;
     if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST &&
         op != TOK_ADDC1 && op != TOK_ADDC2 && op != TOK_SUBC1 &&
         op != TOK_SUBC2 && op != TOK_UMULL) {
@@ -1422,9 +1433,14 @@ ST_FUNC void gen_opi(int op)
         /* low word op; store carry/borrow in the carry slot */
         gv2(RC_INT, RC_INT);
         a = vtop[-1].r; b = vtop[0].r;
+        d = get_reg(RC_INT);   /* while a/b are still on the vstack
+                                   (busy) — after vtop -= 2 they are
+                                   "free" and get_reg would recycle one,
+                                   aliasing d with a source that the
+                                   carry step below re-reads */
         vtop -= 2;
-        d = get_reg(RC_INT);
         vtop++;
+        vtop[0].r = d;
         w_emit_slot_load(a, VT_INT);
         w_emit_slot_load(b, VT_INT);
         w_ins(op == TOK_ADDC1 ? W_I32_ADD : W_I32_SUB);
@@ -1452,12 +1468,21 @@ ST_FUNC void gen_opi(int op)
         vtop[0].r = d;
         return;
     case TOK_UMULL:
-        /* 32x32 -> 64: result in slots d (low) and d2 (high) */
+        /* 32x32 -> 64: result in slots d (low) and d2 (high) — d2 is a
+           REAL register (get_reg allocates the second word
+           independently; d+1 may be busy — the i64 multiply of two
+           small values silently corrupted the high result slot) */
         gv2(RC_INT, RC_INT);
         a = vtop[-1].r; b = vtop[0].r;
+        d = get_reg(RC_INT);   /* while a/b are on the vstack (busy) —
+                                   the high-word step re-reads a and b
+                                   after the low store, and a recycled
+                                   d == a would read the low result */
         vtop -= 2;
-        d = get_reg(RC_INT);
         vtop++;
+        vtop[0].r = d;             /* mark d busy so d2 is distinct */
+        d2 = get_reg(RC_INT);
+        vtop[0].r2 = d2;
         w_emit_slot_load(a, VT_INT);
         w_ins(W_I64_EXTEND_U);
         w_emit_slot_load(b, VT_INT);
@@ -1476,9 +1501,7 @@ ST_FUNC void gen_opi(int op)
         w_u32(32);
         w_ins(W_I64_SHR_U);
         w_ins(W_I32_WRAP);
-        w_emit_slot_store(d + 1, VT_INT);
-        vtop[0].r = d;
-        vtop[0].r2 = d + 1;
+        w_emit_slot_store(d2, VT_INT);
         return;
     default:
         break;
@@ -1535,7 +1558,7 @@ ST_FUNC void gen_opi(int op)
 
 ST_FUNC void gen_opl(int op)
 {
-    int a, b, d, o;
+    int a, b, a2, b2, d, d2, o;
     if (op >= TOK_ULT && op <= TOK_GT) {
         /* 64-bit compares are decomposed by tccgen (gen_opl) using
            gvtst/gjmp — we never get here for compares */
@@ -1551,10 +1574,16 @@ ST_FUNC void gen_opl(int op)
         break;
     }
     gv2(RC_INT, RC_INT);
-    a = vtop[-1].r; b = vtop[0].r;
+    a = vtop[-1].r; a2 = vtop[-1].r2;   /* actual high registers — get_reg
+                                           allocates the second word
+                                           independently, NOT a+1 */
+    b = vtop[0].r; b2 = vtop[0].r2;
+    d = get_reg(RC_INT);   /* while a/a2/b/b2 are on the vstack (busy) */
     vtop -= 2;
-    d = get_reg(RC_INT);
     vtop++;
+    vtop[0].r = d;             /* mark d busy so d2 is distinct */
+    d2 = get_reg(RC_INT);
+    vtop[0].r2 = d2;
     /* combine low words into i64, op, split back */
     switch (op) {
     case '+': o = W_I64_ADD; break;
@@ -1573,7 +1602,7 @@ ST_FUNC void gen_opl(int op)
     /* low: (i64)a, high: (i64)b<<32 | low — combine both operands */
     w_emit_slot_load(a, VT_INT);
     w_ins(W_I64_EXTEND_U);
-    w_emit_slot_load(a + 1, VT_INT);
+    w_emit_slot_load(a2, VT_INT);
     w_ins(W_I64_EXTEND_U);
     w_ins(W_I64_CONST);
     w_u32(32);
@@ -1581,7 +1610,7 @@ ST_FUNC void gen_opl(int op)
     w_ins(W_I64_OR);
     w_emit_slot_load(b, VT_INT);
     w_ins(W_I64_EXTEND_U);
-    w_emit_slot_load(b + 1, VT_INT);
+    w_emit_slot_load(b2, VT_INT);
     w_ins(W_I64_EXTEND_U);
     w_ins(W_I64_CONST);
     w_u32(32);
@@ -1593,7 +1622,7 @@ ST_FUNC void gen_opl(int op)
     w_emit_slot_store(d, VT_INT);
     w_emit_slot_load(a, VT_INT);
     w_ins(W_I64_EXTEND_U);
-    w_emit_slot_load(a + 1, VT_INT);
+    w_emit_slot_load(a2, VT_INT);
     w_ins(W_I64_EXTEND_U);
     w_ins(W_I64_CONST);
     w_u32(32);
@@ -1601,7 +1630,7 @@ ST_FUNC void gen_opl(int op)
     w_ins(W_I64_OR);
     w_emit_slot_load(b, VT_INT);
     w_ins(W_I64_EXTEND_U);
-    w_emit_slot_load(b + 1, VT_INT);
+    w_emit_slot_load(b2, VT_INT);
     w_ins(W_I64_EXTEND_U);
     w_ins(W_I64_CONST);
     w_u32(32);
@@ -1612,9 +1641,7 @@ ST_FUNC void gen_opl(int op)
     w_u32(32);
     w_ins(W_I64_SHR_U);
     w_ins(W_I32_WRAP);
-    w_emit_slot_store(d + 1, VT_INT);
-    vtop[0].r = d;
-    vtop[0].r2 = d + 1;
+    w_emit_slot_store(d2, VT_INT);
 }
 
 ST_FUNC void gen_opf(int op)
