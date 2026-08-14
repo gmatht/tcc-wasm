@@ -310,6 +310,9 @@ static void *wa_grow(void *p, int *alloc, int need, int esz);
    (atexit(fn), fn-pointer compares), in element-section order — the
    value of a kind-2 patch is the slot in this list. */
 static char **wasm_fv; static int wasm_nfv, wasm_fv_alloc;
+/* constructor/destructor functions (__attribute((constructor/destructor))) */
+static char **wasm_ctors; static int wasm_nctors, wasm_ctors_alloc;
+static char **wasm_dtors; static int wasm_ndtors, wasm_dtors_alloc;
 
 static int w_fv_slot(const char *nm)
 {
@@ -983,10 +986,23 @@ static int w_func_ref(Sym *sym)
 static int w_func_defined(Sym *func_sym, int sig)
 {
     int i = w_func_ref(func_sym);
+    const char *nm;
     wasm_funcs[i].defined = 1;
     wasm_funcs[i].import = 0;
     wasm_funcs[i].sig = sig;
     wasm_funcs[i].order = wasm_ndef++;
+    if (func_sym->type.ref && func_sym->type.ref->f.func_ctor) {
+        nm = wasm_funcs[i].name;
+        wasm_ctors = wa_grow(wasm_ctors, &wasm_ctors_alloc,
+                             wasm_nctors + 1, sizeof(char *));
+        wasm_ctors[wasm_nctors++] = tcc_strdup(nm);
+    }
+    if (func_sym->type.ref && func_sym->type.ref->f.func_dtor) {
+        nm = wasm_funcs[i].name;
+        wasm_dtors = wa_grow(wasm_dtors, &wasm_dtors_alloc,
+                             wasm_ndtors + 1, sizeof(char *));
+        wasm_dtors[wasm_ndtors++] = tcc_strdup(nm);
+    }
     return i;
 }
 
@@ -2604,12 +2620,17 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
 
     /* ---- function section ---- */
     wo_init(&sec);
-    wo_leb(&sec, ndef + (main_idx >= 0 ? 1 : 0));
-    for (i = 0; i < wasm_nfuncs; i++)
-        if (wasm_funcs[i].defined)
-            wo_leb(&sec, w_sig_typeidx_of(wasm_funcs[i].sig));
-    if (main_idx >= 0)
-        wo_leb(&sec, w_sig_typeidx_of(sig_start));
+    {
+        int need_ctors = (wasm_nctors > 0 ? 1 : 0) + (wasm_ndtors > 0 ? 1 : 0);
+        wo_leb(&sec, ndef + (main_idx >= 0 ? 1 : 0) + need_ctors);
+        for (i = 0; i < wasm_nfuncs; i++)
+            if (wasm_funcs[i].defined)
+                wo_leb(&sec, w_sig_typeidx_of(wasm_funcs[i].sig));
+        if (main_idx >= 0)
+            wo_leb(&sec, w_sig_typeidx_of(sig_start));
+        for (i = 0; i < need_ctors; i++)
+            wo_leb(&sec, w_sig_typeidx_of(sig_start));
+    }
     wo_sec(&out, 3, &sec);
 
     /* ---- memory section ---- */
@@ -2642,7 +2663,9 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     /* ---- export section ---- */
     wo_init(&sec);
     {
-        int nexp = 1 + (main_idx >= 0 ? 2 : 0) + (wasm_nfv > 0 ? 1 : 0);
+        int need_ctors = (wasm_nctors > 0 ? 1 : 0) + (wasm_ndtors > 0 ? 1 : 0);
+        int nexp = 1 + (main_idx >= 0 ? 2 : 0) + (wasm_nfv > 0 ? 1 : 0)
+                 + need_ctors;
         for (i = 0; i < wasm_nfuncs; i++)
             if (wasm_funcs[i].defined && strcmp(wasm_funcs[i].name, "main"))
                 nexp++;
@@ -2662,6 +2685,17 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
         wo_str(&sec, "_start");
         wo_b(&sec, 0); wo_leb(&sec, start_idx);
     }
+    if (wasm_nctors > 0) {
+        wo_str(&sec, "__wasm_call_ctors");
+        wo_b(&sec, 0);
+        wo_leb(&sec, nimports + ndef + (main_idx >= 0 ? 1 : 0));
+    }
+    if (wasm_ndtors > 0) {
+        wo_str(&sec, "__wasm_call_fini");
+        wo_b(&sec, 0);
+        wo_leb(&sec, nimports + ndef + (main_idx >= 0 ? 1 : 0)
+                      + (wasm_nctors > 0 ? 1 : 0));
+    }
     for (i = 0; i < wasm_nfuncs; i++)
         if (wasm_funcs[i].defined && strcmp(wasm_funcs[i].name, "main")) {
             wo_str(&sec, wasm_funcs[i].name);
@@ -2671,7 +2705,10 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
 
     /* ---- code section ---- */
     wo_init(&sec);
-    wo_leb(&sec, ndef + (main_idx >= 0 ? 1 : 0));
+    {
+        int need_ctors = (wasm_nctors > 0 ? 1 : 0) + (wasm_ndtors > 0 ? 1 : 0);
+        wo_leb(&sec, ndef + (main_idx >= 0 ? 1 : 0) + need_ctors);
+    }
     for (i = 0; i < wasm_nfuncs; i++) {
         if (wasm_funcs[i].defined) {
             WasmFunc *wf = w_func_by_order(wasm_funcs[i].order);
@@ -2745,6 +2782,54 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
         body[bl++] = W_CALL;
         body[bl++] = 1;                    /* proc_exit */
         body[bl++] = W_UNREACHABLE;
+        body[bl++] = W_END;
+        wo_b(&sec, bl + 1);
+        wo_b(&sec, 0x00);                  /* no locals */
+        for (i = 0; i < bl; i++)
+            wo_b(&sec, body[i]);
+    }
+    if (wasm_nctors > 0) {
+        /* __wasm_call_ctors: run the constructor functions in order */
+        int bl = 0;
+        unsigned char body[128];
+        for (i = 0; i < wasm_nctors; i++) {
+            int fi = -1;
+            for (k = 0; k < wasm_nfuncs; k++)
+                if (wasm_funcs[k].defined &&
+                    !strcmp(wasm_funcs[k].name, wasm_ctors[i])) {
+                    fi = func_idx[k];
+                    break;
+                }
+            if (fi < 0)
+                continue;
+            body[bl++] = W_CALL;
+            body[bl++] = fi;
+        }
+        body[bl++] = W_END;
+        wo_b(&sec, bl + 1);
+        wo_b(&sec, 0x00);                  /* no locals */
+        for (i = 0; i < bl; i++)
+            wo_b(&sec, body[i]);
+    }
+    if (wasm_ndtors > 0) {
+        /* __wasm_call_fini: run the destructor functions in order (the
+           runner calls it after main, BEFORE the atexit flush, matching
+           the native ordering where .fini_array runs first) */
+        int bl = 0;
+        unsigned char body[128];
+        for (i = 0; i < wasm_ndtors; i++) {
+            int fi = -1;
+            for (k = 0; k < wasm_nfuncs; k++)
+                if (wasm_funcs[k].defined &&
+                    !strcmp(wasm_funcs[k].name, wasm_dtors[i])) {
+                    fi = func_idx[k];
+                    break;
+                }
+            if (fi < 0)
+                continue;
+            body[bl++] = W_CALL;
+            body[bl++] = fi;
+        }
         body[bl++] = W_END;
         wo_b(&sec, bl + 1);
         wo_b(&sec, 0x00);                  /* no locals */
