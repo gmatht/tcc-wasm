@@ -1419,7 +1419,11 @@ ST_FUNC void gjmp_addr(int a)
     int l = w_new_label();
     wasm_cf->labels[l].pos = a;
     wasm_cf->labels[l].seg = w_seg_at_pos(a);
-    w_add_edge(EDGE_UNCOND, 0, l);
+    /* a loop back-edge inside a genuinely-dead (NOEVAL) region must not
+       fire — mark it -1 so w_layout skips it and the dead code falls
+       through (87_dead_code's dead while(1) looped forever); CODE_OFF
+       alone is not a dead region (switch implicit breaks must fire) */
+    w_add_edge(EDGE_UNCOND, (nocode_wanted & 0xFFFF) ? -1 : 0, l);
 }
 
 ST_FUNC void gsym_addr(int t, int a)
@@ -1451,8 +1455,13 @@ ST_FUNC void gsym_addr(int t, int a)
         t = wasm_cf->edges[e].chain_next;
     }
     if (a == ind) {
-        /* resolution to the current position: fall through */
-        w_add_edge(EDGE_UNCOND, 0, l);
+        /* resolution to the current position: fall through.  The edge
+           is a block-boundary MARKER (not a real jump) — mark it -1 so
+           w_layout skips it and the sub's implicit fallthrough (pc =
+           next) runs instead; a real continue/break chain resolved to
+           the same position still fires (its chain edges are separate
+           and stay op=0). */
+        w_add_edge(EDGE_UNCOND, -1, l);
         w_new_block();
     }
 }
