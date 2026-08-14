@@ -41,3 +41,9 @@ uncommitted computed-goto attempt) that were never pushed — all destroyed.
 `tests/wasm-corpus/run-corpus.mjs` (recreated from the session) — run
 with `TCC_PATH=/tmp/tcc-rb/build-wasm32/tcc TCC_INC=/root/src/tinycc-wasm/include node tests/wasm-corpus/run-corpus.mjs`
 (corpus = tests/tests2, runtime = sh2runtime's src/c-runtime.js).
+
+## Update (same day)
+`build-wasm-tcc.sh` (and its siblings build-wasm-zig.sh / build-wasm-cproc.sh)
+were hardened in sh2runtime commit e83e737: no script deletes an existing
+checkout anymore (tcc reuses the local fork; zig refuses a user-provided
+ZB_DIR; cproc clones-then-swaps).  The default tcc run is now safe.
