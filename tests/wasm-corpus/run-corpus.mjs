@@ -139,7 +139,7 @@ function runDt(cFile) {
   for (let ni = 0; ni < names.length; ni++) {
     const tn = names[ni];
     const wasm = `${OUT}/${name}-dt.wasm`;
-    const sr = spawnSync(TCC, ["-nostdinc", `-I${WASI_INC}`, `-I${INC}`, "-D_WASI_EMULATED_MMAN", `-D${tn}`, cFile, "-o", wasm], { encoding: "utf8" });
+    const sr = spawnSync(TCC, ["-nostdinc", `-I${INC}`, `-I${WASI_INC}`, "-D_WASI_EMULATED_MMAN", `-D${tn}`, cFile, "-o", wasm], { encoding: "utf8" });
     if (ni > 0) out += "\n";
     out += `[${tn}]\n`;
     const err = (sr.stderr || "").replaceAll(CORPUS + "/", "");
@@ -201,7 +201,7 @@ function runOne(cFile, expect) {
   const wasm = `${OUT}/${base.replace(/\.c$/, "")}.wasm`;
   const sources = [base + ".c", ...(COMPANIONS[base] || [])];
   const args = ARGS[base] || [];
-  const sr = spawnSync(TCC, ["-nostdinc", `-I${WASI_INC}`, `-I${INC}`, "-D_WASI_EMULATED_MMAN", ...sources, "-o", wasm], { encoding: "utf8", cwd: CORPUS });
+  const sr = spawnSync(TCC, ["-nostdinc", `-I${INC}`, `-I${WASI_INC}`, "-D_WASI_EMULATED_MMAN", ...sources, "-o", wasm], { encoding: "utf8", cwd: CORPUS });
   if (sr.status !== 0)
     return { kind: "REFUSE", note: (sr.stderr || sr.stdout || "").split("\n").filter(Boolean).pop()?.slice(0, 70) };
   const compWarn = (sr.stderr || "").replaceAll(CORPUS + "/", "");
