@@ -276,7 +276,7 @@ typedef struct WasmImport {
 /* per-function state */
 typedef struct WasmSeg { int start, end, edge; } WasmSeg;
 typedef struct WasmEdge { int kind, op, label, chain_next, seg; } WasmEdge;
-typedef struct WasmLabel { int pos; int sub; } WasmLabel;
+typedef struct WasmLabel { int pos; int sub; int seg; } WasmLabel;
 typedef struct WasmBlk { int fs, ls; } WasmBlk;
 
 typedef struct WasmFunc {
@@ -823,14 +823,24 @@ ST_FUNC void load(int r, SValue *sv)
         }
         /* current block: fallthrough edge -> l_false */
         w_add_edge(EDGE_UNCOND, 0, l_false);
+        /* anchor each label to its code position + segment (w_layout
+           resolves labels by segment — a bare pos is ambiguous when
+           several segments start at one position) */
+        wasm_cf->labels[l_false].pos = ind;
+        wasm_cf->labels[l_false].seg = -1;   /* pos-containment only */
         /* l_false block: r = !inv */
         w_i32_const(inv ^ 1);
         w_emit_slot_store(r, VT_INT);
         w_add_edge(EDGE_UNCOND, 0, l_merge);
         /* l_true block: r = inv */
+        wasm_cf->labels[l_true].pos = ind;
+        wasm_cf->labels[l_true].seg = -1;
         w_i32_const(inv);
         w_emit_slot_store(r, VT_INT);
         w_add_edge(EDGE_UNCOND, 0, l_merge);
+        /* merge: the code that follows */
+        wasm_cf->labels[l_merge].pos = ind;
+        wasm_cf->labels[l_merge].seg = -1;
         return;
     }
     if (sv->r & VT_LVAL) {
@@ -1224,11 +1234,30 @@ ST_FUNC int gjmp_append(int n, int t)
     return n;
 }
 
+/* the segment containing a code position: the closed segment whose
+   range covers pos, or the current (still-open) segment for the
+   current position, or the earliest segment starting at pos (an
+   edge-only boundary). */
+static int w_seg_at_pos(int pos)
+{
+    int i;
+    for (i = 0; i < wasm_cf->nsegs; i++)
+        if (pos >= wasm_cf->segs[i].start && pos < wasm_cf->segs[i].end)
+            return i;
+    for (i = 0; i < wasm_cf->nsegs; i++)
+        if (pos == wasm_cf->segs[i].start)
+            return i;
+    return wasm_cf->cur_seg;
+}
+
 ST_FUNC void gjmp_addr(int a)
 {
-    /* unconditional jump to a code position */
+    /* unconditional jump to a code position (usually BACKWARD — the
+       loop restart): the label's segment is the one containing the
+       TARGET position, not the current emission point */
     int l = w_new_label();
     wasm_cf->labels[l].pos = a;
+    wasm_cf->labels[l].seg = w_seg_at_pos(a);
     w_add_edge(EDGE_UNCOND, 0, l);
 }
 
@@ -1238,6 +1267,11 @@ ST_FUNC void gsym_addr(int t, int a)
        with a fallthrough to the next one (the code continues there) */
     int l = w_new_label();
     wasm_cf->labels[l].pos = a;
+    /* a == ind (the usual gsym): the target code follows, in the next
+       segment.  a != ind (a past/future position — backward/forward
+       chain resolution): use the segment containing a. */
+    wasm_cf->labels[l].seg = (a == ind) ? wasm_cf->cur_seg + 1
+                                        : w_seg_at_pos(a);
     while (t > 0) {
         int e = t - 1;
         wasm_cf->edges[e].label = l;
@@ -1931,7 +1965,13 @@ static void w_layout(void)
     }
     /* fix: end of each sub = end of its last part (done above) */
 
-    /* 3. resolve labels to sub-blocks */
+    /* 3. resolve labels to sub-blocks.  The first pass maps the label to
+       the sub whose range CONTAINS pos; the second handles pos == a
+       sub's START when that sub's range is empty (an edge-only sub like
+       the loop back-edge — [266,266) — containment skips it, but the
+       label at 266 must reach the back-edge, not the exit block that
+       merely follows it: without this the COND edge's fallthrough
+       jumped to the exit and loops exited after one iteration). */
     for (i = 0; i < wasm_cf->nlabels; i++) {
         int pos = wasm_cf->labels[i].pos;
         wasm_cf->labels[i].sub = -1;
@@ -1942,6 +1982,36 @@ static void w_layout(void)
                 wasm_cf->labels[i].sub = j;
                 break;
             }
+        /* resolve by the label's SEGMENT first, but ACCEPT the result
+           only when the sub's code range covers the label's POSITION —
+           the seg heuristic (cur_seg+1 for gsym, seg-at-pos for the
+           backward jumps) is right for the multi-segment boundaries
+           (45_empty_for's back-edge vs exit both at 266) but can
+           overshoot when no edge intervenes (05_array's exit label —
+           seg 7 points at 472 while the label sits at 441).  A
+           mismatched sub is discarded and the position containment
+           used instead. */
+        if (wasm_cf->labels[i].seg >= 0) {
+            for (j = 0; j < nsubs; j++)
+                for (k = 0; k < subs[j].nparts; k++)
+                    if (subs[j].parts[k].seg == wasm_cf->labels[i].seg) {
+                        if (pos >= subs[j].start && pos < subs[j].end) {
+                            wasm_cf->labels[i].sub = j;
+                            break;
+                        }
+                        /* sub starts at pos (an edge-only boundary sub) */
+                        if (pos == subs[j].start) {
+                            wasm_cf->labels[i].sub = j;
+                            break;
+                        }
+                    }
+        }
+        if (wasm_cf->labels[i].sub < 0)
+            for (j = nsubs - 1; j >= 0; j--)
+                if (pos >= subs[j].start && pos < subs[j].end) {
+                    wasm_cf->labels[i].sub = j;
+                    break;
+                }
         if (wasm_cf->labels[i].sub < 0) {
             /* pos == the end of the last sub of a block: use it */
             for (j = nsubs - 1; j >= 0; j--)
@@ -1950,8 +2020,7 @@ static void w_layout(void)
                     wasm_cf->labels[i].sub = j;
                     break;
                 }
-        }
-        if (wasm_cf->labels[i].sub < 0)
+        }        if (wasm_cf->labels[i].sub < 0)
             tcc_error("wasm: internal: unresolved label at %d", pos);
     }
 
