@@ -616,6 +616,7 @@ static int w_new_label(void)
                               wasm_cf->nlabels, sizeof(WasmLabel));
     wasm_cf->labels[i].pos = -1;
     wasm_cf->labels[i].sub = -1;
+    wasm_cf->labels[i].seg = -1;
     return i;
 }
 
@@ -1275,6 +1276,26 @@ ST_FUNC int gjmp_append(int n, int t)
     if (t > 0)
         w_append_chain(n, t);
     return n;
+}
+
+/* signed LEB128: wasm's i32.const decodes the value as SIGNED, so a
+   pc target >= 64 (bit 6 set in the last byte) emitted with an
+   unsigned-style LEB decodes NEGATIVE and the br_table default fires
+   in any function with more than ~64 subs. */
+static void w_body_sleb(unsigned char *body, int *blen, int *balloc, int v)
+{
+    int more = 1, neg = v < 0;
+    while (more) {
+        unsigned char b = v & 0x7f;
+        v >>= 7;
+        if ((neg && v == -1 && !(b & 0x40)) ||
+            (!neg && v == 0 && !(b & 0x40)))
+            more = 0;
+        else
+            b |= 0x80;
+        body = wa_grow(body, balloc, *blen + 1, 1);
+        body[(*blen)++] = b;
+    }
 }
 
 /* the segment containing a code position: the closed segment whose
@@ -2278,9 +2299,7 @@ static void w_layout(void)
                     body = wa_grow(body, &balloc, blen + 20, 1);
                     body[blen++] = W_IF; body[blen++] = BLOCKTYPE_EMPTY;
                     body[blen++] = W_I32_CONST;
-                    v = target;
-                    do { unsigned char b = v & 0x7f; v >>= 7;
-                         if (v) b |= 0x80; body[blen++] = b; } while (v);
+                    w_body_sleb(body, &blen, &balloc, target);
                     body[blen++] = W_LOCAL_SET; body[blen++] = W_PC_LOCAL;
                     /* the br sits inside the if: one level deeper */
                     body[blen++] = W_BR; body[blen++] = i + 2;
@@ -2288,9 +2307,7 @@ static void w_layout(void)
                 } else if (ed->kind == EDGE_UNCOND) {
                     body = wa_grow(body, &balloc, blen + 16, 1);
                     body[blen++] = W_I32_CONST;
-                    v = target;
-                    do { unsigned char b = v & 0x7f; v >>= 7;
-                         if (v) b |= 0x80; body[blen++] = b; } while (v);
+                    w_body_sleb(body, &blen, &balloc, target);
                     body[blen++] = W_LOCAL_SET; body[blen++] = W_PC_LOCAL;
                     body[blen++] = W_BR; body[blen++] = i + 1;
                 } else {
@@ -2309,8 +2326,7 @@ static void w_layout(void)
             int v = next < nsubs ? next : 0;
             body = wa_grow(body, &balloc, blen + 16, 1);
             body[blen++] = W_I32_CONST;
-            do { unsigned char b = v & 0x7f; v >>= 7;
-                 if (v) b |= 0x80; body[blen++] = b; } while (v);
+            w_body_sleb(body, &blen, &balloc, v);
             body[blen++] = W_LOCAL_SET; body[blen++] = W_PC_LOCAL;
             body[blen++] = W_BR; body[blen++] = i + 1;
         }
