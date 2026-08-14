@@ -1379,6 +1379,20 @@ ST_FUNC int gjmp_append(int n, int t)
    pc target >= 64 (bit 6 set in the last byte) emitted with an
    unsigned-style LEB decodes NEGATIVE and the br_table default fires
    in any function with more than ~64 subs. */
+static void w_body_leb(unsigned char *body, int *blen, int *balloc, unsigned int v)
+{
+    /* unsigned LEB (the br depths/counts can exceed 127 when many
+       labels or a big switch split a block — 93_integer_promotion) */
+    do {
+        unsigned char b = v & 0x7f;
+        v >>= 7;
+        if (v)
+            b |= 0x80;
+        body = wa_grow(body, balloc, *blen + 1, 1);
+        body[(*blen)++] = b;
+    } while (v);
+}
+
 static void w_body_sleb(unsigned char *body, int *blen, int *balloc, int v)
 {
     int more = 1, neg = v < 0;
@@ -2544,16 +2558,47 @@ static void w_layout(void)
         body = wa_grow(body, &balloc, blen + 2, 1);
         body[blen++] = W_BLOCK; body[blen++] = BLOCKTYPE_EMPTY;
     }
-    /* br_table: local.get $pc; br_table (labels, default=switch) */
-    body = wa_grow(body, &balloc, blen + 8 + nsubs, 1);
+    /* br_table: local.get $pc; br_table (labels, default=switch).
+       The count and the target depths are unsigned LEBs (nsubs can
+       exceed 127 when a big switch or many labels split a block —
+       93_integer_promotion's br_table count overflowed a single byte
+       and the validator read a huge count). */
+    body = wa_grow(body, &balloc, blen + 8 + nsubs * 2, 1);
     body[blen++] = W_LOCAL_GET; body[blen++] = W_PC_LOCAL;
     body[blen++] = W_BR_TABLE;
-    body[blen++] = nsubs;
+    {
+        int v = nsubs;
+        do {
+            unsigned char b = v & 0x7f;
+            v >>= 7;
+            if (v)
+                b |= 0x80;
+            body = wa_grow(body, &balloc, blen + 1, 1);
+            body[blen++] = b;
+        } while (v);
+    }
     for (i = 0; i < nsubs; i++) {
         int d = nsubs - 1 - i;
-        body[blen++] = d;
+        do {
+            unsigned char b = d & 0x7f;
+            d >>= 7;
+            if (d)
+                b |= 0x80;
+            body = wa_grow(body, &balloc, blen + 1, 1);
+            body[blen++] = b;
+        } while (d);
     }
-    body[blen++] = nsubs;
+    {
+        int v = nsubs;
+        do {
+            unsigned char b = v & 0x7f;
+            v >>= 7;
+            if (v)
+                b |= 0x80;
+            body = wa_grow(body, &balloc, blen + 1, 1);
+            body[blen++] = b;
+        } while (v);
+    }
 
     /* sub-block bodies in reverse order */
     {
@@ -2592,7 +2637,7 @@ static void w_layout(void)
                        skip: the edge carries a DUMMY label (never
                        resolved) and the pc-set must not be emitted. */
                     body = wa_grow(body, &balloc, blen + 4, 1);
-                    body[blen++] = W_BR; body[blen++] = i + 1;
+                    body[blen++] = W_BR; w_body_leb(body, &blen, &balloc, i + 1);
                     if (k == s->nparts - 1)
                         last_has_edge = 1;
                     continue;
@@ -2617,17 +2662,17 @@ static void w_layout(void)
                     w_body_sleb(body, &blen, &balloc, target);
                     body[blen++] = W_LOCAL_SET; body[blen++] = W_PC_LOCAL;
                     /* the br sits inside the if: one level deeper */
-                    body[blen++] = W_BR; body[blen++] = i + 2;
+                    body[blen++] = W_BR; w_body_leb(body, &blen, &balloc, i + 2);
                     body[blen++] = W_END;
                 } else if (ed->kind == EDGE_UNCOND) {
                     body = wa_grow(body, &balloc, blen + 16, 1);
                     body[blen++] = W_I32_CONST;
                     w_body_sleb(body, &blen, &balloc, target);
                     body[blen++] = W_LOCAL_SET; body[blen++] = W_PC_LOCAL;
-                    body[blen++] = W_BR; body[blen++] = i + 1;
+                    body[blen++] = W_BR; w_body_leb(body, &blen, &balloc, i + 1);
                 } else {
                     body = wa_grow(body, &balloc, blen + 4, 1);
-                    body[blen++] = W_BR; body[blen++] = i + 2;
+                    body[blen++] = W_BR; w_body_leb(body, &blen, &balloc, i + 2);
                 }
                 /* only uncond/term edges end the sub-block; a cond edge
                    leaves a fallthrough */
@@ -2643,7 +2688,7 @@ static void w_layout(void)
             body[blen++] = W_I32_CONST;
             w_body_sleb(body, &blen, &balloc, v);
             body[blen++] = W_LOCAL_SET; body[blen++] = W_PC_LOCAL;
-            body[blen++] = W_BR; body[blen++] = i + 1;
+            body[blen++] = W_BR; w_body_leb(body, &blen, &balloc, i + 1);
         }
         }
         /* remap patch offsets via the exact range map */
@@ -3297,6 +3342,14 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
         }
         body[bl++] = W_CALL;
         body[bl++] = main_idx;             /* LEB (main_idx < 128 for v1) */
+        if (main_sig >= 0 && main_sig < wasm_nsigs &&
+            wasm_sigs[main_sig].nresults == 0) {
+            /* a void main leaves no exit code — proc_exit needs one
+               (137_funcall_struct_args's void main produced an invalid
+               module: call with an empty stack) */
+            body[bl++] = W_I32_CONST;
+            body[bl++] = 0;
+        }
         body[bl++] = W_CALL;
         body[bl++] = 1;                    /* proc_exit */
         body[bl++] = W_UNREACHABLE;
