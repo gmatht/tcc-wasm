@@ -7,7 +7,7 @@ Status 2026-08-14 (after the fork-destruction incident + recovery commits).
 | Harness | Tests | PASS | failures |
 |---|---|---|---|
 | sh2runtime runner `__tcc-suite-test.mjs` (717KB tcc.wasm) | 130 | 70 | CCERR 36, DIFF 22, RUNERR 2 |
-| fork corpus `tests/wasm-corpus/run-corpus.mjs` (726e659 + recovered fixes to 7526f01) | 122 | 93 | REFUSE 10, WRONG 6, COMPILE-OUT 2, RUN-TIMEOUT 2, NO-EXPECT 9 |
+| fork corpus `tests/wasm-corpus/run-corpus.mjs` (726e659 + recovered fixes to 344e497) | 122 | 94 | REFUSE 10, WRONG 5, COMPILE-OUT 2, RUN-TIMEOUT 2, NO-EXPECT 9 |
 | fork corpus, LOST state (51 commits, c4655816..3fa1fb6b) | 122 | 110 | reference target |
 
 The runner uses a stale 717KB binary (fork state ~Aug 13 18:56); the fork's
@@ -65,11 +65,17 @@ nocode-suppressed jump edges (88), __wasm_call_ctors/fini (108), the
 f32 arithmetic opcodes off-by-one (22), and the global/member symbol
 offsets dropped in w_emit_addr + load() (25, 10, 46).
 
+344e497: i64 register aliasing (get_reg recycled a source after vtop
+-= 2, so the UMULL/ADDC/gen_opl high-word steps read the clobbered
+value — silent i64 corruption in every small multiply; 118_switch's
+range cases matched the wrong range) + gjmp_cond's w_last_cmp_*
+re-marking fallback.
+
 Remaining: fn-ptr indirect calls (07, 33, 42, 81, 82, 90, 129, 142),
-struct-vararg >4 (73), computed goto (119), i64 range-switch dispatch
-(118 — tccgen skips save_regs for switch compares), alias/__asm__
-resolution (120), the inline-extern status (104), the -dt diffs
-(60, 96, 128), and the dead-code loops (87, 89).
+struct-vararg >4 (73), computed goto (119), alias/__asm__ resolution
+(120), the inline-extern status (104), the -dt diffs (60, 96, 128),
+nested struct-return calls as args (137), the LEB-overflow (93), and
+the dead-code loops (87, 89).
 
 After 04cee4d: 2acdc84 added signed-LEB pc targets (136_atomic_gcc_style
 passes, RUN-CRASH 4->2); 581508c raised the block split cap to
