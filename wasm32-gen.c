@@ -591,7 +591,8 @@ static void w_emit_slot_load(int r, int bt)
     w_emit_slot_addr(r);
     switch (bt) {
     case VT_FLOAT:  w_load(W_F32_LOAD, 2, 0); break;
-    case VT_DOUBLE: w_load(W_F64_LOAD, 3, 0); break;
+    case VT_DOUBLE:
+    case VT_LDOUBLE: w_load(W_F64_LOAD, 3, 0); break;   /* LDOUBLE_SIZE=8 */
     default:        w_load(W_I32_LOAD, 2, 0); break;
     }
 }
@@ -602,14 +603,15 @@ static void w_emit_slot_load(int r, int bt)
 static void w_emit_slot_store(int r, int bt)
 {
     int scr = (bt == VT_FLOAT) ? W_SCRATCH_F32
-            : (bt == VT_DOUBLE) ? W_SCRATCH_F64
+            : (bt == VT_DOUBLE || bt == VT_LDOUBLE) ? W_SCRATCH_F64
             : W_SCRATCH_LOCAL;
     w_local_set(scr);
     w_emit_slot_addr(r);
     w_local_get(scr);
     switch (bt) {
     case VT_FLOAT:  w_store(W_F32_STORE, 4, 2, 0); break;
-    case VT_DOUBLE: w_store(W_F64_STORE, 8, 3, 0); break;
+    case VT_DOUBLE:
+    case VT_LDOUBLE: w_store(W_F64_STORE, 8, 3, 0); break;   /* LDOUBLE_SIZE=8 */
     default:        w_store(W_I32_STORE, 4, 2, 0); break;
     }
 }
@@ -797,8 +799,8 @@ static void w_emit_deref(SValue *sv)
         w_load((sv->type.t & VT_UNSIGNED) ? W_I32_LOAD16_U : W_I32_LOAD16_S, 1, 0);
     else if (bt == VT_FLOAT)
         w_load(W_F32_LOAD, 2, 0);
-    else if (bt == VT_DOUBLE)
-        w_load(W_F64_LOAD, 3, 0);
+    else if (bt == VT_DOUBLE || bt == VT_LDOUBLE)
+        w_load(W_F64_LOAD, 3, 0);   /* LDOUBLE_SIZE=8 */
     else
         w_load(W_I32_LOAD, 2, 0);
 }
@@ -821,7 +823,7 @@ static void w_emit_store(SValue *sv)
         w_store(W_I32_STORE16, 2, 1, 0);
     else if (bt == VT_FLOAT)
         w_store(W_F32_STORE, 4, 2, 0);
-    else if (bt == VT_DOUBLE)
+    else if (bt == VT_DOUBLE || bt == VT_LDOUBLE)
         w_store(W_F64_STORE, 8, 3, 0);
     else
         w_store(W_I32_STORE, 4, 2, 0);
