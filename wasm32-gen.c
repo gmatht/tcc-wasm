@@ -1232,6 +1232,12 @@ ST_FUNC int gjmp(int t)
     int e;
     w_add_edge(EDGE_UNCOND, 0, l);
     e = wasm_cf->nedges;   /* handle of the new edge */
+    if (nocode_wanted & 0xFFFF)
+        /* suppressed jump inside a genuinely-dead region (NOEVAL
+           counting — a dead statement-expression's loop/return): mark
+           the edge so w_layout skips it and the region falls through
+           instead of looping or jumping into dead bytes. */
+        wasm_cf->edges[e - 1].op = -1;
     if (t > 0)
         w_append_chain(t, e);
     return t > 0 ? t : e;
@@ -1240,6 +1246,7 @@ ST_FUNC int gjmp(int t)
 ST_FUNC int gjmp_cond(int op, int t)
 {
     int l = w_new_label();
+    int ins0 = wasm_cf->nins;   /* real (non-suppressed) ops so far */
     /* materialize the comparison: vtop is VT_CMP */
     if (vtop->r == VT_CMP) {
         w_emit_cmp(op, vtop->cmp_r & 0xff, (vtop->cmp_r >> 8) & 0xff);
@@ -1278,6 +1285,12 @@ ST_FUNC int gjmp_cond(int op, int t)
         }
     }
     w_add_edge(EDGE_COND, op, l);
+    if (wasm_cf->nins == ins0)
+        /* the whole condition was suppressed under nocode_wanted: the
+           edge's cond bytes are NOPs (no stack value), so emitting the
+           'if (cond)' wrapper would be an invalid 'if' with an empty
+           stack. Mark the edge; w_layout skips it (fall through). */
+        wasm_cf->edges[wasm_cf->nedges - 1].op = -1;
     if (t > 0)
         w_append_chain(t, wasm_cf->nedges);
     return t > 0 ? t : wasm_cf->nedges;
@@ -2305,6 +2318,15 @@ static void w_layout(void)
                 WasmEdge *ed = &wasm_cf->edges[wasm_cf->segs[seg].edge];
                 int target = ed->label >= 0 ? wasm_cf->labels[ed->label].sub : -1;
                 int v;
+                if (ed->op == -1) {
+                    /* suppressed under nocode_wanted (gjmp/gjmp_cond
+                       marked it): the region is dead — emit nothing and
+                       fall through to the next sub in creation order.
+                       For a COND edge this also skips the 'if (cond)'
+                       wrapper that would otherwise pop a stack value the
+                       suppressed cond never pushed (invalid wasm). */
+                    continue;
+                }
                 if (ed->kind == EDGE_COND) {
                     /* if (cond) { pc = L; br $dispatch } end — the br
                        leaves the current sub so the fall-through path
