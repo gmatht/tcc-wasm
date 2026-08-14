@@ -7,7 +7,7 @@ Status 2026-08-14 (after the fork-destruction incident + recovery commits).
 | Harness | Tests | PASS | failures |
 |---|---|---|---|
 | sh2runtime runner `__tcc-suite-test.mjs` (717KB tcc.wasm) | 130 | 70 | CCERR 36, DIFF 22, RUNERR 2 |
-| fork corpus `tests/wasm-corpus/run-corpus.mjs` (726e659 + 99e60d8 + 3c7dc89) | 122 | 51 | REFUSE 30, WRONG 13, RUN-CRASH 3, COMPILE-OUT 16, NO-EXPECT 9 |
+| fork corpus `tests/wasm-corpus/run-corpus.mjs` (726e659 + recovered fixes to f5d55ce) | 122 | 64 | REFUSE 21, WRONG 11, COMPILE-OUT 14, RUN-CRASH 3, NO-EXPECT 9 |
 | fork corpus, LOST state (51 commits, c4655816..3fa1fb6b) | 122 | 110 | reference target |
 
 The runner uses a stale 717KB binary (fork state ~Aug 13 18:56); the fork's
@@ -56,10 +56,24 @@ Legitimate fixes mirroring the fork corpus + upstream tests2/Makefile.
 
 Gate: runner 70 → ~90; no compiler touched.
 
-## Track 1 — Reconstruct the lost fork work (corpus 51 → 110)
+## Track 1 — Reconstruct the lost fork work (corpus 64 → 110)
 
-(3c7dc89 already re-applied the self-contained 13a/13b edits: _start
-argv, fn-ptr slot machinery, VLA hooks, memory headroom, patch fields.)
+Recovered so far (all pushed to origin/mob, each verified zero-regression):
+- 99e60d8: sret, i64 return pair store, code-buffer grow, NULL guards, data base (45)
+- 3c7dc89: _start argv, fn-ptr slot machinery, VLA hooks, memory headroom, patch fields (51)
+- b3bb78d: alloca.h shadow + include order (53)
+- cee9c9c: w_layout segment-based label resolution (59) — 06_case, 16_nesting,
+  38_multiple_array_index, 45_empty_for, 123_vla_bug, 143_void_expr
+- f5d55ce: VT_JMP result materialization (64) — 11_precedence, 32_led,
+  50_logical_second_arg, 86_memory-model, 152_arm64_addend
+
+NOT recoverable piecemeal (tested, regressed — need the full session-era
+context): the 09 i64/ADDC/UMULL set (op 42-72 — conflicts with the
+re-applied i64 return), the arg-materialization rotation fix (03 op 26 —
+reverted first-attempt), gjmp/gjmp_cond nocode guards (13a op 207/208 —
+breaks 86_memory-model), the br_table size fix (13a op 218), the deferred-
+compare rework (13b op 382 — needs w_last_cmp_* globals), and the
+struct-by-value arg parking (needs the whole 13b gfunc_call).
 
 Use the replay kit (`recovery/replay_engine.py` + `recovery/fork-ops.json`
 from the pi session transcripts).  The engine replays ~470 ops but does not
