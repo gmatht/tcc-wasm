@@ -684,6 +684,8 @@ static int w_slot_ofs(int r)
 
 static void w_emit_slot_addr(int r)
 {
+    if (!wasm_cf)
+        return;   /* constant-eval in a global initializer */
     w_local_get(wasm_cf->nparams);          /* fp */
     w_i32_const(w_slot_ofs(r));
     w_ins(W_I32_ADD);
@@ -692,6 +694,8 @@ static void w_emit_slot_addr(int r)
 /* load the value of slot r onto the wasm stack */
 static void w_emit_slot_load(int r, int bt)
 {
+    if (!wasm_cf)
+        return;   /* constant-eval in a global initializer */
     w_emit_slot_addr(r);
     switch (bt) {
     case VT_FLOAT:  w_load(W_F32_LOAD, 2, 0); break;
@@ -706,7 +710,12 @@ static void w_emit_slot_load(int r, int bt)
    value in a scratch local, push the address, then reload it. */
 static void w_emit_slot_store(int r, int bt)
 {
-    int scr = (bt == VT_FLOAT) ? W_SCRATCH_F32
+    int scr;
+    if (!wasm_cf)
+        return;   /* constant-eval in a global initializer (the i++ of
+                     60_errors' test_74 — the frontend evaluates it
+                     before rejecting it as non-constant) */
+    scr = (bt == VT_FLOAT) ? W_SCRATCH_F32
             : (bt == VT_DOUBLE || bt == VT_LDOUBLE) ? W_SCRATCH_F64
             : W_SCRATCH_LOCAL;
     w_local_set(scr);
@@ -860,8 +869,11 @@ static void w_emit_cmp(int op, int a, int b)
 /* emit the address of an lvalue (SValue) onto the wasm stack */
 static void w_emit_addr(SValue *sv)
 {
-    int v = sv->r & VT_VALMASK;
-    int fc = sv->c.i;
+    int v, fc;
+    if (!wasm_cf)
+        return;   /* constant-eval in a global initializer */
+    v = sv->r & VT_VALMASK;
+    fc = sv->c.i;
     if (sv->r & VT_LVAL) {
         if (v == VT_LOCAL) {
             w_local_get(wasm_cf->nparams);
@@ -894,7 +906,10 @@ static void w_emit_addr(SValue *sv)
 /* emit the value of an lvalue (dereference) */
 static void w_emit_deref(SValue *sv)
 {
-    int bt = sv->type.t & VT_BTYPE;
+    int bt;
+    if (!wasm_cf)
+        return;   /* constant-eval in a global initializer */
+    bt = sv->type.t & VT_BTYPE;
     int al, sz = type_size(&sv->type, &al);
     if (bt == VT_STRUCT)
         tcc_error("wasm: struct deref");
