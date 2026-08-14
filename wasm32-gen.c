@@ -773,6 +773,8 @@ static void w_emit_addr(SValue *sv)
             w_load(W_I32_LOAD, 2, 0);
         } else if (v == VT_CONST && (sv->r & VT_SYM)) {
             w_i32_patch(1, sv->sym);
+            if (fc)
+                w_i32_const(fc), w_ins(W_I32_ADD);   /* member offset */
         } else if (v == VT_CONST) {
             w_i32_const(fc);
         } else if (v < VT_CONST) {
