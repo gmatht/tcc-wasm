@@ -1720,11 +1720,11 @@ ST_FUNC void gen_cvt_ftoi(int t)
     vtop--;
     d = get_reg(RC_INT);
     vtop++;
-    w_emit_slot_load(r, ft == VT_DOUBLE ? VT_DOUBLE : VT_FLOAT);
+    w_emit_slot_load(r, (ft == VT_DOUBLE || ft == VT_LDOUBLE) ? VT_DOUBLE : VT_FLOAT);
     if (t & VT_UNSIGNED)
-        w_ins(ft == VT_DOUBLE ? W_I32_TRUNC_F64_U : W_I32_TRUNC_F32_U);
+        w_ins((ft == VT_DOUBLE || ft == VT_LDOUBLE) ? W_I32_TRUNC_F64_U : W_I32_TRUNC_F32_U);
     else
-        w_ins(ft == VT_DOUBLE ? W_I32_TRUNC_F64_S : W_I32_TRUNC_F32_S);
+        w_ins((ft == VT_DOUBLE || ft == VT_LDOUBLE) ? W_I32_TRUNC_F64_S : W_I32_TRUNC_F32_S);
     w_emit_slot_store(d, VT_INT);
     vtop[0].r = d;
 }
