@@ -326,6 +326,8 @@ static WasmFunc *wasm_cf;    /* current function */
 static WasmFunc **wasm_func_list = NULL;
 static int wasm_nfunc_list = 0, wasm_func_list_alloc = 0;
 static int wasm_ndef;        /* defined funcs emitted so far */
+static int w_park_cursor;    /* next free parking slot (frame words below the body) */
+static int w_last_cmp_r, w_last_cmp_a, w_last_cmp_b;  /* last deferred compare's operands */
 static int wasm_nimp;        /* imports so far: 2 (fd_write, proc_exit) + n */
 static int wasm_text_size;
 static int wasm_data_size;
@@ -443,6 +445,12 @@ static void w_s32(int v)
 
 static void w_i32_const_patch_slot_dummy(int kind, Sym *sym);
 
+/* is the symbol a function (its address is a code/table pointer)? */
+static int w_sym_is_func(Sym *sym)
+{
+    return sym && (sym->type.t & VT_BTYPE) == VT_FUNC;
+}
+
 /* emit i32.const with a 5-byte patchable slot; record the patch */
 static void w_i32_patch(int kind, Sym *sym)
 {
@@ -515,6 +523,17 @@ static void w_memop(int op, int al, int off)
     w_ins(op);
     w_u32(al);
     w_u32(off);
+}
+
+/* memory.copy (bulk-memory): [dst, src, len] on the wasm stack, copies
+   len bytes, overlap-safe (memmove semantics).  memidx 0/0 = memory 0. */
+static void w_mem_copy(int len)
+{
+    w_i32_const(len);
+    w_ins(0xfc);
+    g(0x0a);
+    g(0x00);
+    g(0x00);
 }
 
 static void w_br(int depth) { w_ins(W_BR); w_u32(depth); }
@@ -803,7 +822,13 @@ ST_FUNC void load(int r, SValue *sv)
 
     if (v == VT_CMP) {
         /* deferred comparison: compute 0/1, store to slot r */
-        w_emit_cmp(sv->cmp_op, sv->cmp_r & 0xff, (sv->cmp_r >> 8) & 0xff);
+        int ca = sv->cmp_r & 0xff, cb = (sv->cmp_r >> 8) & 0xff;
+        if (sv->cmp_r != w_last_cmp_r) {
+            /* re-marked comparison (see gen_opi): use the last one */
+            ca = w_last_cmp_a;
+            cb = w_last_cmp_b;
+        }
+        w_emit_cmp(sv->cmp_op, ca, cb);
         w_emit_slot_store(r, VT_INT);
         return;
     }
@@ -859,13 +884,20 @@ ST_FUNC void load(int r, SValue *sv)
             union { float f; unsigned u; } u;
             u.f = sv->c.f;
             w_i32_const(u.u);
-            w_emit_slot_store(r, VT_FLOAT);
-        } else if (bt == VT_DOUBLE) {
+            w_emit_slot_store(r, VT_INT);   /* the bits ARE the f32 */
+        } else if (bt == VT_DOUBLE || bt == VT_LDOUBLE) {
             union { double d; unsigned u[2]; } u;
             u.d = sv->c.d;
             w_i32_const(u.u[0]);
             w_emit_slot_store(r, VT_INT);
-            tcc_error("wasm: double const needs 64-bit slot");
+            /* high word at slot r + 4 (the second half of the slot's
+               8-byte interval, so a single F64 load at slot r reads
+               both words back) */
+            w_emit_slot_addr(r);
+            w_i32_const(4);
+            w_ins(W_I32_ADD);
+            w_i32_const(u.u[1]);
+            w_ins(W_I32_STORE); w_u32(2); w_u32(0);
         } else {
             w_i32_const(fc);
             w_emit_slot_store(r, VT_INT);
@@ -1024,6 +1056,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
 
     /* register file + locals */
     loc = -(NB_REGS * 8);
+    w_park_cursor = ((-loc + 15) & ~15) >> 3;
     ind = 0;
     w_open_seg();
 
@@ -1058,6 +1091,14 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
         int byref = 0;
         type = &sym->type;
         size = type_size(type, &align);
+        if ((type->t & VT_BTYPE) == VT_STRUCT) {
+            /* structs arrive by POINTER (the caller copied the value to
+               a temp): the param home holds the pointer, so member
+               access must deref through it — force VT_LLOCAL even for
+               small structs (byref=0 would leave the pointer in the
+               struct's home and s.a would read the pointer's bytes) */
+            byref = 1;
+        }
         if (size > 8) {
             type = &char_pointer_type;
             size = align = byref = 4;
@@ -1379,6 +1420,13 @@ ST_FUNC void gen_opi(int op)
         vtop++;
         vset_VT_CMP(op);
         vtop[0].cmp_r = a | (b << 8);
+        /* remember the operands: tccgen's 64-bit compare decomposition
+           re-marks a value as VT_CMP(NE) via vset_VT_CMP without
+           setting cmp_r (x86's CPU flags are the source of truth there;
+           the re-mark means "the last comparison") */
+        w_last_cmp_a = a;
+        w_last_cmp_b = b;
+        w_last_cmp_r = a | (b << 8);
         return;
     }
     gv2(RC_INT, RC_INT);
@@ -1647,7 +1695,8 @@ static int w_import_get(const char *name, int sig)
    functions, this call's actual (promoted) vararg types.  Default
    promotions (float→double etc.) are applied by the frontend
    (gfunc_param_typed) before we get here. */
-static int w_call_sig(CType *ft, int nb_args, int *pnparams, int *pvariadic)
+static int w_call_sig(CType *ft, int nb_args, int *pnparams, int *pvariadic,
+                   int *pnfixed)
 {
     Sym *s;
     unsigned char params[64];
@@ -1673,11 +1722,17 @@ static int w_call_sig(CType *ft, int nb_args, int *pnparams, int *pvariadic)
             int bt = sv->type.t & VT_BTYPE;
             if (n >= 60)
                 tcc_error("wasm: too many params");
-            if (bt == VT_STRUCT)
-                tcc_error("wasm: struct vararg unsupported");
-            if (bt == VT_LLONG)
-                tcc_error("wasm: i64 vararg unsupported");
-            if (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE)
+            if (bt == VT_STRUCT) {
+                /* small struct vararg: pass the first 4 bytes as an i32
+                   value (the env helpers like $__atomic_store_4 expect
+                   the VALUE, not a pointer) */
+                int al, sz = type_size(&sv->type, &al);
+                if (sz > 4)
+                    tcc_error("wasm: struct vararg larger than 4 bytes");
+                params[n++] = VAL_I32;
+            } else if (bt == VT_LLONG)
+                params[n++] = VAL_I64;
+            else if (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE)
                 params[n++] = VAL_F64;
             else
                 params[n++] = VAL_I32;
@@ -1687,9 +1742,9 @@ static int w_call_sig(CType *ft, int nb_args, int *pnparams, int *pvariadic)
     nres = ((ft->ref->type.t & VT_BTYPE) == VT_VOID) ? 0 : 1;
     *pnparams = n;
     *pvariadic = variadic;
+    *pnfixed = n_fixed;
     return w_sig_get(n, params, nres, res);
 }
-
 /* ---------------------------------------------------------------- */
 /* calls */
 
@@ -1706,7 +1761,10 @@ ST_FUNC void gfunc_call(int nb_args)
     int *slots;
     CType *ft;
     Sym *sym;
-    int sig, nparams, variadic;
+    int sig, nparams, variadic, nfixed;
+    int bt;
+    int has_struct_arg = 0;
+    int park_reserve = 0;
 
     ft = &vtop[-nb_args].type;
     sym = vtop[-nb_args].sym;
@@ -1714,7 +1772,7 @@ ST_FUNC void gfunc_call(int nb_args)
                 (VT_CONST | VT_SYM)) {
         tcc_error("wasm: indirect call (function pointer) unsupported");
     }
-    sig = w_call_sig(ft, nb_args, &nparams, &variadic);
+    sig = w_call_sig(ft, nb_args, &nparams, &variadic, &nfixed);
     /* Register the env import (name, sig).  Variadic calls get one import
        per distinct signature — wasm allows same-name imports with
        different types, and the shell's JS runtime takes (...args).
@@ -1725,30 +1783,142 @@ ST_FUNC void gfunc_call(int nb_args)
     save_regs(nb_args + 1);
 
     slots = tcc_malloc(nb_args * sizeof(int));
-    /* materialize args into slots (reverse order: bring each arg to
-       the top of the value stack, gv it, then restore) */
-    for (i = 0; i < nb_args; i++) {
-        SValue *sv = &vtop[1 + i - nb_args];
-        int bt = sv->type.t & VT_BTYPE;
-        if (bt == VT_STRUCT)
-            tcc_error("wasm: struct by-value args unsupported");
-        vrotb(i + 1);
-        gv((bt == VT_FLOAT || bt == VT_DOUBLE) ? RC_FLOAT : RC_INT);
-        slots[nb_args - 1 - i] = vtop->r;
-        vrott(i + 1);
+    {
+        /* the parking region must sit BELOW the frame; locals are
+           allocated during the body, so re-derive the frame bottom at
+           every call (the prolog cursor is stale once a local exists) */
+        int frame8 = ((-loc + 15) & ~15) >> 3;
+        int base = w_park_cursor < frame8 ? frame8 : w_park_cursor;
+        int cur = base;
+        for (i = 0; i < nb_args; i++) {
+            vrotb(i + 1);
+            /* the parked value is vtop[0] after the rotation — its OWN
+               type decides the parking width (the sv of the fixed-arg
+               loop can differ: the args are processed bottom-up) */
+            bt = vtop->type.t & VT_BTYPE;
+            slots[nb_args - 1 - i] = cur;
+            if (bt == VT_STRUCT && i >= nfixed && variadic) {
+                /* small struct VARARG: pass the first 4 bytes as an
+                   i32 VALUE (the env helpers expect the value, not a
+                   pointer — w_call_sig used VAL_I32 for this arg) */
+                int al, sz = type_size(&vtop->type, &al);
+                if (sz > 4)
+                    tcc_error("wasm: struct vararg larger than 4 bytes");
+                if (!(vtop->r & VT_LVAL))
+                    tcc_error("wasm: struct vararg not an lvalue");
+                w_emit_addr(vtop);
+                w_load(W_I32_LOAD, 2, 0);
+                w_emit_slot_store(cur, VT_INT);
+                has_struct_arg = 1;
+                cur++;
+            } else if (bt == VT_STRUCT) {
+                /* by-value struct arg: copy to a parking temp
+                   (memory.copy), park the temp's address as the i32
+                   arg — the callee stores the pointer in the param
+                   home and member access derefs through it */
+                int al, sz = type_size(&vtop->type, &al);
+                int words = (sz + 7) >> 3;
+                /* the copy runs UP from the base for sz bytes, so the
+                   base must sit a full words*8 BELOW the parking slot
+                   (fp-8*(cur+1)) or the copy overwrites the address
+                   parked there (structs > 8 bytes) */
+                int temp_ofs = -(8 * (cur + 1)) - (words << 3);
+                if (!(vtop->r & VT_LVAL))
+                    tcc_error("wasm: struct arg not an lvalue");
+                w_local_get(wasm_cf->nparams);
+                w_i32_const(temp_ofs);
+                w_ins(W_I32_ADD);                      /* [dst] */
+                w_emit_addr(vtop);                     /* [dst, src] */
+                w_mem_copy(sz);                        /* [dst,src,len] */
+                w_local_get(wasm_cf->nparams);
+                w_i32_const(temp_ofs);
+                w_ins(W_I32_ADD);                      /* [temp addr] */
+                w_emit_slot_store(cur, VT_INT);
+                has_struct_arg = 1;
+                cur += words + 1;
+            } else if (bt == VT_LLONG) {
+                /* i64 = two 4-byte words: low at slot, high at slot+1 */
+                if (vtop->r & VT_LVAL) {
+                    /* the value lives in memory: park both words */
+                    w_emit_addr(vtop);
+                    w_load(W_I32_LOAD, 2, 0);
+                    w_emit_slot_store(cur, VT_INT);
+                    w_emit_addr(vtop);
+                    w_i32_const(4);
+                    w_ins(W_I32_ADD);
+                    w_load(W_I32_LOAD, 2, 0);
+                    w_emit_slot_store(cur + 1, VT_INT);
+                } else if ((vtop->r & (VT_VALMASK | VT_SYM)) == VT_CONST) {
+                    /* numeric 64-bit constant: park both words directly */
+                    uint64_t cv = (uint64_t)vtop->c.i;
+                    w_emit_slot_addr(cur);
+                    w_i32_const((int)(cv & 0xffffffffu));
+                    w_ins(W_I32_STORE); w_u32(2); w_u32(0);
+                    w_emit_slot_addr(cur + 1);
+                    w_i32_const((int)(cv >> 32));
+                    w_ins(W_I32_STORE); w_u32(2); w_u32(0);
+                } else if (vtop->r & VT_SYM) {
+                    /* an address constant: low word = the address */
+                    w_i32_patch(w_sym_is_func(vtop->sym) ? 2 : 1, vtop->sym);
+                    w_emit_slot_store(cur, VT_INT);
+                    w_emit_slot_addr(cur + 1);
+                    w_i32_const(0);
+                    w_ins(W_I32_STORE); w_u32(2); w_u32(0);
+                } else if ((vtop->r & VT_VALMASK) < VT_CONST) {
+                    /* register pair: r = low, r2 = high */
+                    w_emit_slot_load(vtop->r & VT_VALMASK, VT_INT);
+                    w_emit_slot_store(cur, VT_INT);
+                    w_emit_slot_load(vtop->r2 & VT_VALMASK, VT_INT);
+                    w_emit_slot_store(cur + 1, VT_INT);
+                } else {
+                    tcc_error("wasm: unimp i64 arg park (r=0x%x)", vtop->r);
+                }
+                cur += 2;
+            } else {
+                load(cur, vtop);
+                cur++;
+            }
+            vrott(i + 1);
+        }
+        w_park_cursor = cur;
+        if (has_struct_arg) {
+            /* the struct temps live below the frame, i.e. below the
+               caller's sp — but the callee's frame is allocated below
+               sp at the CALL, so without protection the callee (and
+               its own inner-call parking) clobbers the temps while
+               still dereferencing them.  Reserve the whole parking
+               depth by lowering sp (x86-64's sub rsp for struct args):
+               the callee's frame then starts below the temps. */
+            park_reserve = cur << 3;
+            w_global_get();
+            w_i32_const(-park_reserve);
+            w_ins(W_I32_ADD);
+            w_global_set();
+        }
     }
     /* result address (for the store) goes below the args */
     ret_bt = ft->ref->type.t & VT_BTYPE;
-    res_slot = (ret_bt == VT_FLOAT || ret_bt == VT_DOUBLE) ? REG_FRET : REG_IRET;
+    res_slot = (ret_bt == VT_FLOAT || ret_bt == VT_DOUBLE || ret_bt == VT_LDOUBLE) ? REG_FRET : REG_IRET;
     if (ret_bt != VT_STRUCT)
         w_emit_slot_addr(res_slot);
     /* push args in order (on top of the address) */
     for (i = 0; i < nb_args; i++) {
         SValue *sv = &vtop[1 + i - nb_args];
         int bt = sv->type.t & VT_BTYPE;
-        if (bt == VT_LLONG)
-            tcc_error("wasm: i64 arg unsupported");
-        w_emit_slot_load(slots[i], (bt == VT_FLOAT || bt == VT_DOUBLE) ? bt : VT_INT);
+        if (bt == VT_LLONG) {
+            /* i64: combine the low/high words from the parking slots
+               (low at slots[i], high at slots[i]+1) */
+            w_emit_slot_addr(slots[i]);
+            w_load(W_I32_LOAD, 2, 0);
+            w_ins(W_I64_EXTEND_U);
+            w_emit_slot_addr(slots[i] + 1);
+            w_load(W_I32_LOAD, 2, 0);
+            w_ins(W_I64_EXTEND_U);
+            w_ins(W_I64_CONST); w_u32(32);
+            w_ins(W_I64_SHL);
+            w_ins(W_I64_OR);
+        } else
+            w_emit_slot_load(slots[i], (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE) ? bt : VT_INT);
     }
     w_call(sym, sig);
     /* store the result */
@@ -1780,6 +1950,13 @@ ST_FUNC void gfunc_call(int nb_args)
         w_store(W_I32_STORE, 4, 2, 0);          /* high -> slot 1 */
     } else {
         w_store(W_I32_STORE, 4, 2, 0);
+    }
+    if (has_struct_arg) {
+        /* release the reserved depth: sp += park_reserve */
+        w_global_get();
+        w_i32_const(park_reserve);
+        w_ins(W_I32_ADD);
+        w_global_set();
     }
     tcc_free(slots);
     vtop -= nb_args + 1;
