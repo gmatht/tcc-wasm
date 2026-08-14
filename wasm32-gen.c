@@ -327,6 +327,9 @@ static WasmFunc **wasm_func_list = NULL;
 static int wasm_nfunc_list = 0, wasm_func_list_alloc = 0;
 static int wasm_ndef;        /* defined funcs emitted so far */
 static int w_park_cursor;    /* next free parking slot (frame words below the body) */
+#define W_BLK_SPLITS 128   /* max label split positions per block (14 merged a
+                                 20-case switch's extra handlers into the first
+                                 sub — case N ran case N-1's body) */
 static int w_last_cmp_r, w_last_cmp_a, w_last_cmp_b;  /* last deferred compare's operands */
 static int wasm_nimp;        /* imports so far: 2 (fd_write, proc_exit) + n */
 static int wasm_text_size;
@@ -2088,32 +2091,32 @@ static void w_layout(void)
     int ret_valtype;
 
     /* 1. collect split positions per block (from labels) */
-    cnt = tcc_mallocz(nb * sizeof(int) * 16);
+    cnt = tcc_mallocz(nb * sizeof(int) * (W_BLK_SPLITS + 1));
     for (i = 0; i < wasm_cf->nlabels; i++) {
         int pos = wasm_cf->labels[i].pos;
         if (pos >= 0) {
             int b = w_block_at_pos(pos);
-            int c = cnt[b * 16], m, dup = 0;
+            int c = cnt[b * (W_BLK_SPLITS + 1)], m, dup = 0;
             for (m = 0; m < c; m++)
-                if (cnt[b * 16 + 1 + m] == pos)
+                if (cnt[b * (W_BLK_SPLITS + 1) + 1 + m] == pos)
                     dup = 1;
-            if (!dup && c < 14)
-                cnt[b * 16 + 1 + (cnt[b * 16]++)] = pos;
+            if (!dup && c < W_BLK_SPLITS)
+                cnt[b * (W_BLK_SPLITS + 1) + 1 + (cnt[b * (W_BLK_SPLITS + 1)]++)] = pos;
         }
     }
     for (i = 0; i < nb; i++) {
-        int c = cnt[i * 16];
+        int c = cnt[i * (W_BLK_SPLITS + 1)];
         for (j = 1; j < c; j++)
-            for (k = j; k > 0 && cnt[i * 16 + 1 + k - 1] > cnt[i * 16 + 1 + k]; k--) {
-                int t = cnt[i * 16 + 1 + k - 1];
-                cnt[i * 16 + 1 + k - 1] = cnt[i * 16 + 1 + k];
-                cnt[i * 16 + 1 + k] = t;
+            for (k = j; k > 0 && cnt[i * (W_BLK_SPLITS + 1) + 1 + k - 1] > cnt[i * (W_BLK_SPLITS + 1) + 1 + k]; k--) {
+                int t = cnt[i * (W_BLK_SPLITS + 1) + 1 + k - 1];
+                cnt[i * (W_BLK_SPLITS + 1) + 1 + k - 1] = cnt[i * (W_BLK_SPLITS + 1) + 1 + k];
+                cnt[i * (W_BLK_SPLITS + 1) + 1 + k] = t;
             }
     }
 
     /* 2. build sub-blocks (split each block at its positions) */
     for (i = 0; i < nb; i++) {
-        int seg, si = 0, c = cnt[i * 16];
+        int seg, si = 0, c = cnt[i * (W_BLK_SPLITS + 1)];
         subs = wa_grow(subs, &sub_alloc, nsubs + 1, sizeof(WSub));
         memset(&subs[nsubs], 0, sizeof(WSub));
         subs[nsubs].blk = i;
@@ -2122,8 +2125,8 @@ static void w_layout(void)
         for (seg = wasm_cf->blks[i].fs; seg <= wasm_cf->blks[i].ls; seg++) {
             int pos = wasm_cf->segs[seg].start;
             int segend = wasm_cf->segs[seg].end;
-            while (si < c && cnt[i * 16 + 1 + si] < segend) {
-                int p = cnt[i * 16 + 1 + si];
+            while (si < c && cnt[i * (W_BLK_SPLITS + 1) + 1 + si] < segend) {
+                int p = cnt[i * (W_BLK_SPLITS + 1) + 1 + si];
                 if (p > pos) {
                     WSub *s = &subs[nsubs - 1];
                     s->parts = wa_grow(s->parts, &s->part_alloc,
