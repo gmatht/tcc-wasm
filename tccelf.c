@@ -67,6 +67,16 @@ ST_FUNC void tccelf_new(TCCState *s)
     /* create standard sections */
     text_section = new_section(s, ".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
     data_section = new_section(s, ".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
+#ifdef TCC_TARGET_WASM32
+    /* pad .data by 256 bytes BEFORE anything is laid out: address 0 is
+       the C NULL pointer, and string addresses (which tccgen folds to
+       plain constants during codegen) must never collide with it.
+       Padding the SECTION shifts every data/rodata offset naturally. */
+    {
+        unsigned char *pad = section_ptr_add(data_section, 256);
+        memset(pad, 0, 256);
+    }
+#endif
     /* create ro data section (make ro after relocation done with GNU_RELRO) */
     rodata_section = new_section(s, rdata, SHT_PROGBITS, shf_RELRO);
     bss_section = new_section(s, ".bss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE);

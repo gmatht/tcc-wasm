@@ -333,6 +333,7 @@ static int reg_ofs(int r)
 #define W_SCRATCH_LOCAL (wasm_cf->nparams + 2)
 #define W_SCRATCH_F32 (wasm_cf->nparams + 3)
 #define W_SCRATCH_F64 (wasm_cf->nparams + 4)
+#define W_SCRATCH_I64 (wasm_cf->nparams + 5)
 
 /* ---------------------------------------------------------------- */
 /* growable arrays */
@@ -364,12 +365,18 @@ ST_FUNC void o(unsigned int c)
 
 ST_FUNC void g(int c)
 {
+    /* data-initializer evaluation outside any function: no code buffer
+       (60_errors' `int i = i++;` crashed on the NULL wasm_cf) */
+    if (!wasm_cf)
+        return;
     if (nocode_wanted)
         return;
-    if (wasm_cf->csize == ind) {
+    if (wasm_cf->csize <= ind) {
+        /* grow when the buffer is FULL (<=, not ==: under nocode_wanted
+           w_ins() advances ind without emitting, so after a dead-code
+           stretch csize < ind and the next real byte would overflow) */
         wasm_cf->code = wa_grow(wasm_cf->code, &wasm_cf->csize,
                                 ind + 1, 1);
-        wasm_cf->csize = ind + 1;
     }
     wasm_cf->code[ind++] = c;
 }
@@ -377,6 +384,8 @@ ST_FUNC void g(int c)
 static void w_ins(int op)
 {
     /* record instruction start position, then emit the opcode */
+    if (!wasm_cf)
+        return;   /* data-initializer evaluation outside any function */
     if (nocode_wanted) {
         ind++;
         return;
@@ -974,7 +983,7 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
     w_sig_from_type(func_type, &w_func_sig, &nwasmparams);
     wasm_cf->sig = w_func_sig;
     wasm_cf->nparams = nwasmparams;
-    wasm_cf->nlocals = 5;   /* fp, pc, scratch_i32/f32/f64 */
+    wasm_cf->nlocals = 6;   /* fp, pc, scratch_i32/f32/f64/i64 */
     wasm_cf->has_sret = ((func_type->ref->type.t & VT_BTYPE) == VT_STRUCT);
     {
         int ref = w_func_defined(func_sym, w_func_sig);
@@ -1043,8 +1052,23 @@ ST_FUNC void gfunc_prolog(Sym *func_sym)
             else if (vt == VAL_F64)
                 w_store(W_F64_STORE, 8, 3, 0);
             else if (vt == VAL_I64) {
-                w_store(W_I64_STORE, 8, 3, 0);
-                tcc_error("wasm: i64 param store needs pair");
+                /* the outer code has already pushed [addr, param]; park
+                   the param in the i64 scratch, store the low word to the
+                   pending addr, then the high word at loc+4 (little-
+                   endian var home) — never push the param again, or the
+                   outer [addr, param] dangles and unbalances the stack */
+                w_local_set(W_SCRATCH_I64);              /* [] (param parked) */
+                w_local_get(W_SCRATCH_I64);
+                w_ins(W_I32_WRAP);
+                w_store(W_I32_STORE, 4, 2, 0);           /* low → pending addr */
+                w_local_get(wasm_cf->nparams);           /* fp */
+                w_i32_const(loc + 4);
+                w_ins(W_I32_ADD);
+                w_local_get(W_SCRATCH_I64);
+                w_ins(W_I64_CONST); w_u32(32);
+                w_ins(W_I64_SHR_U);
+                w_ins(W_I32_WRAP);
+                w_store(W_I32_STORE, 4, 2, 0);           /* high → loc+4 */
             } else
                 w_store(W_I32_STORE, 4, 2, 0);
         }
@@ -1676,15 +1700,29 @@ ST_FUNC void gfunc_call(int nb_args)
     if (ret_bt == VT_VOID) {
         /* nothing on the stack */
     } else if (ret_bt == VT_STRUCT) {
-        /* sret: the result is written via the sret pointer by the callee */
-        tcc_error("wasm: struct return call unsupported");
+        /* sret: the result was written via the sret pointer by the callee;
+           the frontend keeps the result as the local the pointer pointed
+           to — no register store needed */
     } else if (ret_bt == VT_FLOAT) {
         w_store(W_F32_STORE, 4, 2, 0);
     } else if (ret_bt == VT_DOUBLE) {
         w_store(W_F64_STORE, 8, 3, 0);
     } else if (ret_bt == VT_LLONG) {
-        w_store(W_I64_STORE, 8, 3, 0);
-        tcc_error("wasm: i64 return needs pair store");
+        /* pair store: the i64 result (on the wasm stack above the
+           result-slot address) splits into the two 4-byte return
+           slots (REG_IRET low, REG_IRE2 high).  An 8-byte store at
+           slot 0 would miss slot 1 — the register slots sit 8 bytes
+           apart (reg_ofs(r) = -8*(r+1)). */
+        w_local_set(W_SCRATCH_I64);
+        w_local_get(W_SCRATCH_I64);
+        w_ins(W_I32_WRAP);
+        w_store(W_I32_STORE, 4, 2, 0);          /* low  -> slot 0 */
+        w_emit_slot_addr(REG_IRE2);
+        w_local_get(W_SCRATCH_I64);
+        w_ins(W_I64_CONST); w_u32(32);
+        w_ins(W_I64_SHR_U);
+        w_ins(W_I32_WRAP);
+        w_store(W_I32_STORE, 4, 2, 0);          /* high -> slot 1 */
     } else {
         w_store(W_I32_STORE, 4, 2, 0);
     }
@@ -2314,12 +2352,14 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                         }
                     }
                 }
-                /* locals: 3x i32 (fp, pc, scratch_i32), 1x f32, 1x f64 */
-                wo_leb(&sec, wf->flen + 7);
-                wo_b(&sec, 0x03);           /* 3 groups */
+                /* locals: 3x i32 (fp, pc, scratch_i32), 1x f32, 1x f64,
+                   1x i64 (scratch_i64) */
+                wo_leb(&sec, wf->flen + 9);
+                wo_b(&sec, 0x04);           /* 4 groups */
                 wo_b(&sec, 0x03); wo_b(&sec, VAL_I32);
                 wo_b(&sec, 0x01); wo_b(&sec, VAL_F32);
                 wo_b(&sec, 0x01); wo_b(&sec, VAL_F64);
+                wo_b(&sec, 0x01); wo_b(&sec, VAL_I64);
                 for (j = 0; j < wf->flen; j++)
                     wo_b(&sec, wf->final[j]);
             }
