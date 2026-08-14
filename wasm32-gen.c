@@ -261,7 +261,8 @@ typedef struct WasmPatch {
     Sym *sym;            /* referenced symbol (NULL for frame-size) */
     char *name;          /* C function name, strdup'd at patch time
                             (get_tok_str is unsafe at output time) */
-    int kind;            /* 0 = function index, 1 = data address */
+    int kind;            /* 0 = function index, 1 = data address,
+                            2 = function value (table slot) */
     int dsec, dofs;      /* data symbol: section index + offset (kind 1),
                             captured at patch time (sym->c is not stable) */
     int sig;             /* call signature (kind 0; per-call for varargs) */
@@ -303,6 +304,24 @@ typedef struct WasmFunc {
 static WasmSig *wasm_sigs;   static int wasm_nsigs, wasm_sig_alloc;
 static WasmFuncRef *wasm_funcs; static int wasm_nfuncs, wasm_func_alloc;
 static WasmImport *wasm_imports; static int wasm_nimports, wasm_import_alloc;
+static void *wa_grow(void *p, int *alloc, int need, int esz);
+
+/* function-value table: names of functions whose ADDRESS is taken
+   (atexit(fn), fn-pointer compares), in element-section order — the
+   value of a kind-2 patch is the slot in this list. */
+static char **wasm_fv; static int wasm_nfv, wasm_fv_alloc;
+
+static int w_fv_slot(const char *nm)
+{
+    int i;
+    for (i = 0; i < wasm_nfv; i++)
+        if (!strcmp(wasm_fv[i], nm))
+            return i;
+    wasm_fv = wa_grow(wasm_fv, &wasm_fv_alloc, wasm_nfv + 1, sizeof(char *));
+    wasm_fv[wasm_nfv] = tcc_strdup(nm);
+    return wasm_nfv++;
+}
+
 static WasmFunc *wasm_cf;    /* current function */
 static WasmFunc **wasm_func_list = NULL;
 static int wasm_nfunc_list = 0, wasm_func_list_alloc = 0;
@@ -1763,17 +1782,41 @@ ST_FUNC void gen_increment_tcov(SValue *sv)
 
 ST_FUNC void gen_vla_sp_save(int addr)
 {
-    tcc_error("wasm: VLA unsupported");
+    /* [fp+addr] = sp — the restore point (or the VLA's base after an
+       alloc: gen_vla_alloc lowers sp, then this saves the new sp) */
+    w_local_get(wasm_cf->nparams);
+    w_i32_const(addr);
+    w_ins(W_I32_ADD);
+    w_global_get();
+    w_store(W_I32_STORE, 4, 2, 0);
 }
 
 ST_FUNC void gen_vla_sp_restore(int addr)
 {
-    tcc_error("wasm: VLA unsupported");
+    /* sp = [fp+addr] */
+    w_local_get(wasm_cf->nparams);
+    w_i32_const(addr);
+    w_ins(W_I32_ADD);
+    w_load(W_I32_LOAD, 2, 0);
+    w_global_set();
 }
 
 ST_FUNC void gen_vla_alloc(CType *type, int align)
 {
-    tcc_error("wasm: VLA unsupported");
+    /* vtop = the allocation size (bytes): sp -= size, aligned down.
+       The new sp IS the VLA's base — the frontend's following
+       gen_vla_sp_save stores it into the VLA's local slot. */
+    int r = gv(RC_INT);
+    int a = align > 8 ? align : 8;
+    w_global_get();
+    w_emit_slot_load(r, VT_INT);
+    w_ins(W_I32_SUB);
+    if (a > 1) {
+        w_i32_const(-a);
+        w_ins(W_I32_AND);
+    }
+    w_global_set();
+    vpop();
 }
 
 ST_FUNC void gen_bounds_call(int v)
@@ -1912,8 +1955,7 @@ static void w_layout(void)
             tcc_error("wasm: internal: unresolved label at %d", pos);
     }
 
-    /* 4. emit the final body */
-    ret_valtype = w_typeof(&func_vt);
+    /* 4. emit the final body */    ret_valtype = w_typeof(&func_vt);
     if ((func_vt.t & VT_BTYPE) == VT_VOID)
         ret_valtype = 0;
     if ((func_vt.t & VT_BTYPE) == VT_LLONG)
@@ -2167,6 +2209,11 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     sig_fdwrite = w_sig_get(4, p4, 0, 0);
     sig_procexit = w_sig_get(1, p4, 0, 0);
     sig_start = w_sig_get(0, p4, 0, 0);
+    if (getenv("WASM_FUNC_DBG"))
+        for (i = 0; i < wasm_nfuncs; i++)
+            fprintf(stderr, "F: %s defined=%d import=%d order=%d\n",
+                    wasm_funcs[i].name, wasm_funcs[i].defined,
+                    wasm_funcs[i].import, wasm_funcs[i].order);
     tcc_enter_state(s);   /* make the section macros resolve correctly */
     w_sec_data = data_section;
     w_sec_rodata = rodata_section;
@@ -2184,6 +2231,8 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                 break;
             }
         imp_idx[i] = defined ? -1 : nimports++;
+        if (getenv("WASM_FUNC_DBG") && defined)
+            fprintf(stderr, "IMP: %s -> defined (dropped)\n", wasm_imports[i].name);
     }
     for (i = 0; i < wasm_nfuncs; i++) {
         if (wasm_funcs[i].defined) {
@@ -2267,7 +2316,11 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
             rodata_section ? (int)rodata_section->data_offset : -1,
     data_end = (data_section->data_offset + rodata_section->data_offset
                 + bss_section->data_offset + 15) & ~15;
-    npages = (data_end + 0x20000 + 0xffff) >> 16;
+    /* the stack grows down from the top of memory: the 128KB headroom
+       is enough for ordinary tests, but 119_random_stuff's 256KB struct
+       by-value copies park ~1MB below sp — give the memory a full MB
+       of stack headroom so those fit */
+    npages = (data_end + 0x100000 + 0xffff) >> 16;
     if (npages < 16)
         npages = 16;
     wo_init(&sec);
@@ -2289,7 +2342,7 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     /* ---- export section ---- */
     wo_init(&sec);
     {
-        int nexp = 1 + (main_idx >= 0 ? 2 : 0);
+        int nexp = 1 + (main_idx >= 0 ? 2 : 0) + (wasm_nfv > 0 ? 1 : 0);
         for (i = 0; i < wasm_nfuncs; i++)
             if (wasm_funcs[i].defined && strcmp(wasm_funcs[i].name, "main"))
                 nexp++;
@@ -2297,6 +2350,12 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     }
     wo_str(&sec, "memory");
     wo_b(&sec, 2); wo_leb(&sec, 0);
+    if (wasm_nfv > 0) {
+        /* the function-value table — the env runtime resolves fn values
+           (atexit handlers, fn pointers) through it */
+        wo_str(&sec, "__indirect_function_table");
+        wo_b(&sec, 1); wo_leb(&sec, 0);
+    }
     if (main_idx >= 0) {
         wo_str(&sec, "main");
         wo_b(&sec, 0); wo_leb(&sec, main_idx);
@@ -2366,9 +2425,21 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
         }
     }
     if (main_idx >= 0) {
-        /* _start: call main; call proc_exit; unreachable; end */
+        /* _start: push argc/argv (main's params, 0-filled — the wasm
+           runner calls _start with no WASI args), call main, call
+           proc_exit, unreachable, end */
         int bl = 0;
         unsigned char body[32];
+        int main_sig = -1, np = 0;
+        for (i = 0; i < wasm_nfuncs; i++)
+            if (wasm_funcs[i].defined && !strcmp(wasm_funcs[i].name, "main"))
+                main_sig = wasm_funcs[i].sig;
+        if (main_sig >= 0 && main_sig < wasm_nsigs)
+            np = wasm_sigs[main_sig].nparams;
+        for (i = 0; i < np; i++) {
+            body[bl++] = W_I32_CONST;
+            body[bl++] = 0;
+        }
         body[bl++] = W_CALL;
         body[bl++] = main_idx;             /* LEB (main_idx < 128 for v1) */
         body[bl++] = W_CALL;
@@ -2395,7 +2466,7 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     for (i = 0; i < rodata_section->data_offset; i++)
         wo_b(&sec, rodata_section->data[i]);
     for (i = 0; i < bss_section->data_offset; i++)
-        wo_b(&sec, bss_section->data[i]);
+        wo_b(&sec, 0);   /* bss: no initialized content — all zeros */
     wo_sec(&out, 11, &sec);
 
     /* ---- write the file ---- */
