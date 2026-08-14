@@ -1,0 +1,18 @@
+diff --git a/tccgen.c b/tccgen.c
+index 52706ba5..de01d531 100644
+--- a/tccgen.c
++++ b/tccgen.c
+@@ -169,13 +169,6 @@ ST_FUNC void gsym(int t)
+   if (t) {
+     gsym_addr(t, ind);
+     CODE_ON();
+-  } else {
+-    /* a label definition with no goto chain (a &&label used only by
+-       address — computed gotos): the backend still needs the label's
+-       position.  The wasm32 backend splits a block there so the label
+-       value can target it.  Other backends' gsym_addr is a no-op for
+-       an empty chain. */
+-    gsym_addr(0, ind);
+   }
+ }
+ 

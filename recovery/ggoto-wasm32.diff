@@ -1,0 +1,249 @@
+diff --git a/wasm32-gen.c b/wasm32-gen.c
+index 31d9fe83..631da041 100644
+--- a/wasm32-gen.c
++++ b/wasm32-gen.c
+@@ -308,8 +308,6 @@ typedef struct WasmFunc {
+     int has_sret;
+     int order;           /* body emission order */
+     unsigned char *final; int flen;       /* laid-out body */
+-    int *sub_starts, *sub_ends; int nsubs_out;  /* position -> sub map
+-                                                   (for &&label values) */
+ } WasmFunc;
+ 
+ static WasmSig *wasm_sigs;   static int wasm_nsigs, wasm_sig_alloc;
+@@ -1465,9 +1463,6 @@ ST_FUNC void gsym_addr(int t, int a)
+ {
+     /* resolve the jump chain t to position a; close the current block
+        with a fallthrough to the next one (the code continues there) */
+-    if (!wasm_cf)
+-        return;   /* data-initializer / preprocessor evaluation (the
+-                     tccgen's gsym also calls us for the empty chain) */
+     int l = w_new_label();
+     wasm_cf->labels[l].pos = a;
+     /* a == ind (the usual gsym): the target code follows, in the next
+@@ -2310,6 +2305,7 @@ ST_FUNC void gfunc_call(int nb_args)
+         w_store(W_F64_STORE, 8, 3, 0);
+     } else if (ret_bt == VT_LLONG) {
+         w_store(W_I64_STORE, 8, 3, 0);
++        tcc_error("wasm: i64 return needs pair store");
+     } else {
+         w_store(W_I32_STORE, 4, 2, 0);
+     }
+@@ -2326,35 +2322,7 @@ ST_FUNC void gfunc_call(int nb_args)
+ 
+ ST_FUNC void ggoto(void)
+ {
+-    /* computed goto (GCC extension): vtop = the label's address
+-       (&&lbl).  A CONSTANT label (goto *&&lbl) is a direct jump to
+-       the label's sub; a runtime value (goto *gostring[i]) is
+-       dispatched by setting pc and branching to the dispatcher. */
+-    if (!wasm_cf)
+-        return;
+-    if (nocode_wanted & 0xFFFF) {
+-        vtop--;
+-        return;
+-    }
+-    if ((vtop->r & VT_VALMASK) == VT_CONST && vtop->sym) {
+-        /* constant: jump directly to the label's code position */
+-        int pos = vtop->sym->jind;
+-        if (getenv("WASM_FUNC_DBG"))
+-            fprintf(stderr, "GGOTO-CONST %s jind=%d r=0x%x\n",
+-                    get_tok_str(vtop->sym->v, NULL), pos, vtop->r);
+-        vtop--;
+-        gjmp_addr(pos);
+-        return;
+-    }
+-    {
+-        /* runtime: the label value (a sub index) becomes the pc */
+-        int r = gv(RC_INT);
+-        vtop--;
+-        w_emit_slot_load(r, VT_INT);
+-        w_local_set(W_PC_LOCAL);
+-        w_add_edge(EDGE_UNCOND, -2, w_new_label());
+-        w_new_block();
+-    }
++    tcc_error("wasm: computed goto unsupported");
+ }
+ 
+ /* ---------------------------------------------------------------- */
+@@ -2595,22 +2563,8 @@ static void w_layout(void)
+             tcc_error("wasm: internal: unresolved label at %d", pos);
+     }
+ 
+-    /* capture the &&label patches: at LAYOUT time the label sym's jind
+-       is its final code position (the sym is freed/reused by output
+-       time — 125 -> 520 in a later function).  Mark the patch so the
+-       output resolves the label's VALUE to the SUB INDEX of the code
+-       at that position (the pc dispatch is by sub). */
+-    for (i = 0; i < wasm_cf->npatches; i++) {
+-        WasmPatch *pp = &wasm_cf->patches[i];
+-        if (pp->kind == 1 && pp->sym && pp->sym->c &&
+-            elfsym(pp->sym)->st_shndx == text_section->sh_num &&
+-            pp->sym->jind >= 0) {
+-            pp->dofs = pp->sym->jind;
+-            pp->dsec = -2;
+-        }
+-    }
+-
+-    /* 4. emit the final body */    if (getenv("WASM_RAW_DBG")) {
++    /* 4. emit the final body */
++    if (getenv("WASM_RAW_DBG")) {
+         FILE *rf = fopen("/tmp/rawdump.bin", "wb");
+         if (rf) { fwrite(wasm_cf->code, 1, ind, rf); fclose(rf); }
+     }
+@@ -2703,22 +2657,6 @@ static void w_layout(void)
+                 WasmEdge *ed = &wasm_cf->edges[wasm_cf->segs[seg].edge];
+                 int target = ed->label >= 0 ? wasm_cf->labels[ed->label].sub : -1;
+                 int v;
+-                if (ed->op == -2) {
+-                    /* computed goto (ggoto): the pc was ALREADY set to
+-                       the runtime label value — just br back to the
+-                       dispatcher.  Checked BEFORE the unresolved-label
+-                       skip: the edge carries a DUMMY label (never
+-                       resolved) and must not be discarded — the skip
+-                       would drop the br and the sub's implicit
+-                       fallthrough would OVERWRITE the pc that ggoto
+-                       just set (the dispatcher then jumps to a constant
+-                       sub instead of the runtime label). */
+-                    body = wa_grow(body, &balloc, blen + 4, 1);
+-                    body = w_br_depth(body, &blen, &balloc, i + 1);
+-                    if (k == s->nparts - 1)
+-                        last_has_edge = 1;
+-                    continue;
+-                }
+                 if (ed->label >= 0 && wasm_cf->labels[ed->label].sub < 0) {
+                     /* The jump's label never resolved to a sub (a chain
+                        gsym never reached — dead/aborted code). There is
+@@ -2807,13 +2745,6 @@ static void w_layout(void)
+ 
+     wasm_cf->final = body;
+     wasm_cf->flen = blen;
+-    wasm_cf->nsubs_out = nsubs;
+-    wasm_cf->sub_starts = tcc_malloc(nsubs * sizeof(int));
+-    wasm_cf->sub_ends = tcc_malloc(nsubs * sizeof(int));
+-    for (i = 0; i < nsubs; i++) {
+-        wasm_cf->sub_starts[i] = subs[i].start;
+-        wasm_cf->sub_ends[i] = subs[i].end;
+-    }
+     for (i = 0; i < nsubs; i++)
+         tcc_free(subs[i].parts);
+     tcc_free(subs);
+@@ -2832,29 +2763,6 @@ static WasmFunc *w_func_by_order(int order)
+     return NULL;
+ }
+ 
+-/* position (in the raw code buffer) -> sub index (the pc dispatch
+-   value).  Mirrors the label->sub resolution in w_layout: containment
+-   first, then pos == a sub's start, then pos == the end of the last
+-   sub of a block. */
+-static int w_label_sub(WasmFunc *wf, int pos)
+-{
+-    int k;
+-    if (!wf || wf->nsubs_out <= 0)
+-        return -1;
+-    for (k = 0; k < wf->nsubs_out; k++)
+-        if (pos >= wf->sub_starts[k] && pos < wf->sub_ends[k])
+-            return k;
+-    for (k = 0; k < wf->nsubs_out; k++)
+-        if (pos == wf->sub_starts[k])
+-            return k;
+-    for (k = wf->nsubs_out - 1; k >= 0; k--)
+-        if (pos >= wf->sub_starts[k] && pos <= wf->sub_ends[k] &&
+-            (k + 1 >= wf->nsubs_out ||
+-             (wf->sub_starts[k + 1] != wf->sub_starts[k])))
+-            return k;
+-    return -1;
+-}
+-
+ /* sig -> type-section index mapping (built at output time) */
+ static int *w_sig_ti_used = NULL;
+ static int w_sig_ti_n = 0;
+@@ -2964,49 +2872,6 @@ static void w_apply_data_relocs(TCCState *st, Section *sec,
+                     es->st_shndx, ELFW(ST_TYPE)(es->st_info),
+                     text_section->sh_num, STT_FUNC);
+         if (es->st_shndx == text_section->sh_num
+-            && ELFW(ST_TYPE)(es->st_info) != STT_FUNC) {
+-            /* a &&label (GCC extension): its VALUE is the sub index of
+-               the code at the label's position — the computed-goto
+-               dispatch runs by sub.  Find the defining function via its
+-               captured kind-1 patches (name + position match) when the
+-               label is also addressed in code; otherwise (90's gostring
+-               array addresses labels only from data) match the position
+-               against the function's sub map — the label splits its
+-               block, so the position is a sub start. */
+-            v = 0;
+-            for (k = 0; k < wasm_nfunc_list && v == 0; k++) {
+-                WasmFunc *wf = wasm_func_list[k];
+-                int q2, si = -1;
+-                for (q2 = 0; q2 < wf->npatches; q2++) {
+-                    WasmPatch *pp = &wf->patches[q2];
+-                    if (pp->kind == 1 && pp->dsec == -2 &&
+-                        pp->dofs == es->st_value &&
+-                        pp->name && !strcmp(pp->name, nm)) {
+-                        si = w_label_sub(wf, es->st_value);
+-                        break;
+-                    }
+-                }
+-                if (si < 0) {
+-                    /* no in-code patch: the DEFINING function is the
+-                       one with a sub STARTing at the position (the
+-                       label split its block there — earlier functions'
+-                       subs only CONTAIN the offset); the VALUE is the
+-                       containing sub, NOT the empty edge-only sub that
+-                       starts at the position (that would skip the
+-                       label's own code) */
+-                    int has_start = 0;
+-                    for (q2 = 0; q2 < wf->nsubs_out; q2++)
+-                        if (wf->sub_starts[q2] == es->st_value) {
+-                            has_start = 1;
+-                            break;
+-                        }
+-                    if (has_start)
+-                        si = w_label_sub(wf, es->st_value);
+-                }
+-                if (si >= 0)
+-                    v = si;
+-            }
+-        } else if (es->st_shndx == text_section->sh_num
+             || es->st_shndx == SHN_ABS
+             || ELFW(ST_TYPE)(es->st_info) == STT_FUNC) {
+             /* function address — the table slot */
+@@ -3566,24 +3431,15 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
+                         }
+                         if (getenv("WASM_FUNC_DBG"))
+                             fprintf(stderr, "  -> ds=%d dofs=%d\n", ds, dofs);
+-                        if (p->dsec == -2) {
+-                            /* a &&label captured at layout time: the
+-                               value is the SUB INDEX of the code at the
+-                               label's position — the computed-goto
+-                               dispatch is by sub */
+-                            int si = w_label_sub(wf, p->dofs);
+-                            v = si >= 0 ? si : 0;
+-                        } else if (ds == w_sec_data->sh_num ||
++                        if (ds == w_sec_data->sh_num ||
+                             ds == w_sec_rodata->sh_num ||
+                             ds == w_sec_bss->sh_num)
+                             v = w_data_addr_of(ds, dofs);
+                         else if (ds == text_section->sh_num)
+-                            /* a &&label in the text section (GCC
+-                               extension): the SUB INDEX of the code at
+-                               the label's position — non-zero so
+-                               label-distance tests work (96_nodata) and
+-                               dispatchable by the computed goto */
+-                            v = w_label_sub(wf, dofs);
++                            /* a label's address (&&label in GCC
++                               extensions): the label's code position —
++                               non-zero so label-distance tests work */
++                            v = dofs;
+                         else if (p->sym && p->sym->jind) {
+                             /* a &&label with no ELF entry yet (the sym is
+                                reused after the function — the jind is the
+@@ -3596,7 +3452,7 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
+                             int lp = p->sym->jind;
+                             while (lp < wf->csize && wf->code[lp] == 0x01)
+                                 lp++;
+-                            v = w_label_sub(wf, lp);
++                            v = lp;
+                         } else
+                             v = 0;   /* undefined/unknown — NULL */
+                     } else if (p->kind == 2 && p->name) {
