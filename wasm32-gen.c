@@ -213,6 +213,7 @@ ST_DATA int func_bound_add_epilog;
 #define W_I32_TRUNC_F32_S 0xa8
 #define W_I32_TRUNC_F32_U 0xa9
 #define W_I32_TRUNC_F64_S 0xaa
+#define W_CALL_INDIRECT 0x11
 #define W_I32_TRUNC_F64_U 0xab
 #define W_I64_EXTEND_S 0xac
 #define W_I64_EXTEND_U 0xad
@@ -313,6 +314,29 @@ static char **wasm_fv; static int wasm_nfv, wasm_fv_alloc;
 /* constructor/destructor functions (__attribute((constructor/destructor))) */
 static char **wasm_ctors; static int wasm_nctors, wasm_ctors_alloc;
 static char **wasm_dtors; static int wasm_ndtors, wasm_dtors_alloc;
+/* signatures used by call_indirect (function pointers) — must be in
+   the type section even though no direct function has them */
+static int *wasm_indir_sigs; static int wasm_nindir, wasm_indir_alloc;
+
+static void w_indir_sig(int sig)
+{
+    int i;
+    for (i = 0; i < wasm_nindir; i++)
+        if (wasm_indir_sigs[i] == sig)
+            return;
+    wasm_indir_sigs = wa_grow(wasm_indir_sigs, &wasm_indir_alloc,
+                              wasm_nindir + 1, sizeof(int));
+    wasm_indir_sigs[wasm_nindir++] = sig;
+}
+
+static int w_fv_find(const char *nm)
+{
+    int i;
+    for (i = 0; i < wasm_nfv; i++)
+        if (!strcmp(wasm_fv[i], nm))
+            return i;
+    return -1;
+}
 
 static int w_fv_slot(const char *nm)
 {
@@ -772,7 +796,7 @@ static void w_emit_addr(SValue *sv)
             w_ins(W_I32_ADD);
             w_load(W_I32_LOAD, 2, 0);
         } else if (v == VT_CONST && (sv->r & VT_SYM)) {
-            w_i32_patch(1, sv->sym);
+            w_i32_patch(w_sym_is_func(sv->sym) ? 2 : 1, sv->sym);
             if (fc)
                 w_i32_const(fc), w_ins(W_I32_ADD);   /* member offset */
         } else if (v == VT_CONST) {
@@ -898,7 +922,7 @@ ST_FUNC void load(int r, SValue *sv)
     /* plain value */
     if (v == VT_CONST) {
         if (sv->r & VT_SYM) {
-            w_i32_patch(1, sv->sym);
+            w_i32_patch(w_sym_is_func(sv->sym) ? 2 : 1, sv->sym);
             if (fc)
                 w_i32_const(fc), w_ins(W_I32_ADD);   /* member offset */
             w_emit_slot_store(r, VT_INT);
@@ -1871,7 +1895,95 @@ ST_FUNC void gfunc_call(int nb_args)
     sym = vtop[-nb_args].sym;
     if (!sym || (vtop[-nb_args].r & (VT_VALMASK | VT_LVAL | VT_SYM)) !=
                 (VT_CONST | VT_SYM)) {
-        tcc_error("wasm: indirect call (function pointer) unsupported");
+        /* indirect call through a function pointer: the callee value is
+           a table index (a function-value slot).  Materialize the args
+           into the parking slots, then push the callee index and emit
+           call_indirect with the per-call signature's typeidx. */
+        int callee_r;
+        sig = w_call_sig(ft, nb_args, &nparams, &variadic, &nfixed);
+        w_indir_sig(sig);
+        save_regs(nb_args + 1);
+        slots = tcc_malloc(nb_args * sizeof(int));
+        {
+            int frame8 = ((-loc + 15) & ~15) >> 3;
+            int base = w_park_cursor < frame8 ? frame8 : w_park_cursor;
+            int cur = base;
+            /* park the callee pointer too (last slot) */
+            vrotb(nb_args + 1);
+            load(base + nb_args, vtop);
+            callee_r = base + nb_args;
+            vrott(nb_args + 1);
+            for (i = 0; i < nb_args; i++) {
+                vrotb(i + 1);
+                bt = vtop->type.t & VT_BTYPE;
+                slots[nb_args - 1 - i] = cur;
+                if (bt == VT_STRUCT)
+                    tcc_error("wasm: struct fn-ptr arg unsupported");
+                else if (bt == VT_LLONG)
+                    tcc_error("wasm: i64 fn-ptr arg unsupported");
+                else {
+                    load(cur, vtop);
+                    cur++;
+                }
+                vrott(i + 1);
+            }
+            w_park_cursor = cur;
+        }
+        /* result address (for the store) goes below the args */
+        ret_bt = ft->ref->type.t & VT_BTYPE;
+        res_slot = (ret_bt == VT_FLOAT || ret_bt == VT_DOUBLE || ret_bt == VT_LDOUBLE) ? REG_FRET : REG_IRET;
+        if (ret_bt != VT_STRUCT)
+            w_emit_slot_addr(res_slot);
+        /* push args in order (on top of the address) */
+        for (i = 0; i < nb_args; i++) {
+            SValue *sv = &vtop[1 + i - nb_args];
+            int bt = sv->type.t & VT_BTYPE;
+            w_emit_slot_load(slots[i], (bt == VT_FLOAT || bt == VT_DOUBLE || bt == VT_LDOUBLE) ? bt : VT_INT);
+        }
+        /* the callee's table index (the parked function value) */
+        w_emit_slot_load(callee_r, VT_INT);
+        w_ins(W_CALL_INDIRECT);
+        /* 5-byte patchable type-index slot (kind 3, resolved at output) */
+        {
+            int tslot = ind, t;
+            for (t = 0; t < 4; t++)
+                g(0x80);
+            g(0x00);
+            wasm_cf->patches = wa_grow(wasm_cf->patches,
+                &wasm_cf->npatch_alloc, wasm_cf->npatches + 1,
+                sizeof(WasmPatch));
+            wasm_cf->patches[wasm_cf->npatches].ofs = tslot;
+            wasm_cf->patches[wasm_cf->npatches].sym = NULL;
+            wasm_cf->patches[wasm_cf->npatches].name = NULL;
+            wasm_cf->patches[wasm_cf->npatches].kind = 3;  /* indir typeidx */
+            wasm_cf->patches[wasm_cf->npatches].sig = sig;
+            wasm_cf->npatches++;
+        }
+        w_u32(0);                             /* table 0 */
+        /* store the result */
+        if (ret_bt == VT_VOID) {
+        } else if (ret_bt == VT_STRUCT) {
+        } else if (ret_bt == VT_FLOAT) {
+            w_store(W_F32_STORE, 4, 2, 0);
+        } else if (ret_bt == VT_DOUBLE || ret_bt == VT_LDOUBLE) {
+            w_store(W_F64_STORE, 8, 3, 0);
+        } else if (ret_bt == VT_LLONG) {
+            w_local_set(W_SCRATCH_I64);
+            w_local_get(W_SCRATCH_I64);
+            w_ins(W_I32_WRAP);
+            w_store(W_I32_STORE, 4, 2, 0);
+            w_emit_slot_addr(REG_IRE2);
+            w_local_get(W_SCRATCH_I64);
+            w_ins(W_I64_CONST); w_u32(32);
+            w_ins(W_I64_SHR_U);
+            w_ins(W_I32_WRAP);
+            w_store(W_I32_STORE, 4, 2, 0);
+        } else {
+            w_store(W_I32_STORE, 4, 2, 0);
+        }
+        tcc_free(slots);
+        vtop -= nb_args + 1;
+        return;
     }
     sig = w_call_sig(ft, nb_args, &nparams, &variadic, &nfixed);
     /* Register the env import (name, sig).  Variadic calls get one import
@@ -2547,6 +2659,33 @@ static void add_used(int *used, int *pnused, int s)
     used[(*pnused)++] = s;
 }
 
+/* resolve a section's relocations in the output data: function symbols
+   become table slots (fv + 1), data symbols become linear addresses */
+static void w_apply_data_relocs(TCCState *s1, Section *sec, unsigned char *out)
+{
+    Section *sr = sec->reloc;
+    int i;
+    for (i = 0; i < (int)(sr->data_offset / sizeof(ElfW_Rel)); i++) {
+        ElfW_Rel *rel = &((ElfW_Rel *)sr->data)[i];
+        int si = ELFW(R_SYM)(rel->r_info);
+        ElfW(Sym) *es = &((ElfW(Sym) *)symtab_section->data)[si];
+        unsigned char *p = out + rel->r_offset;
+        char *nm = &((char *)symtab_section->link->data)[es->st_name];
+        int v = 0;
+        if (es->st_shndx == text_section->sh_num
+            || es->st_shndx == SHN_ABS
+            || ELFW(ST_TYPE)(es->st_info) == STT_FUNC) {
+            /* function address — the table slot */
+            int fv = w_fv_find(nm);
+            v = (fv >= 0) ? fv + 1 : 0;
+        } else {
+            v = w_data_addr_of(es->st_shndx, es->st_value);
+        }
+        p[0] = v & 0xff; p[1] = (v >> 8) & 0xff;
+        p[2] = (v >> 16) & 0xff; p[3] = (v >> 24) & 0xff;
+    }
+}
+
 ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
 {
     WOut out = {0}, sec = {0};
@@ -2568,6 +2707,45 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                     wasm_funcs[i].name, wasm_funcs[i].defined,
                     wasm_funcs[i].import, wasm_funcs[i].order);
     tcc_enter_state(s);   /* make the section macros resolve correctly */
+    /* collect function-value slots: kind-2 patches (address-of-function
+       in code — a fn passed as an argument) + data/rodata relocs
+       (global fn-ptr initializers like int (*f)(int) = &fred) */
+    for (i = 0; i < wasm_nfuncs; i++) {
+        if (!wasm_funcs[i].defined)
+            continue;
+        {
+            WasmFunc *wf = w_func_by_order(wasm_funcs[i].order);
+            if (!wf)
+                continue;
+            for (j = 0; j < wf->npatches; j++)
+                if (wf->patches[j].kind == 2 && wf->patches[j].name)
+                    w_fv_slot(wf->patches[j].name);
+        }
+    }
+    for (i = 0; i < wasm_ndtors; i++)
+        w_fv_slot(wasm_dtors[i]);   /* atexit registration needs a slot */
+    {
+        Section *sr;
+        int secs[2]; secs[0] = data_section->sh_num; secs[1] = rodata_section->sh_num;
+        for (k = 0; k < 2; k++) {
+            sr = (secs[k] == data_section->sh_num) ? data_section->reloc
+                                                   : rodata_section->reloc;
+            if (!sr)
+                continue;
+            for (i = 0; i < (int)(sr->data_offset / sizeof(ElfW_Rel)); i++) {
+                ElfW_Rel *rel = &((ElfW_Rel *)sr->data)[i];
+                int si = ELFW(R_SYM)(rel->r_info);
+                ElfW(Sym) *es = &((ElfW(Sym) *)symtab_section->data)[si];
+                char *nm = &((char *)symtab_section->link->data)[es->st_name];
+                if (es->st_shndx == text_section->sh_num ||
+                    es->st_shndx == SHN_ABS ||
+                    ELFW(ST_TYPE)(es->st_info) == STT_FUNC)
+                    w_fv_slot(nm);
+            }
+        }
+    }
+
+
     w_sec_data = data_section;
     w_sec_rodata = rodata_section;
     w_sec_bss = bss_section;
@@ -2608,6 +2786,8 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
         add_used(used, &nused, wasm_imports[i].sig);
     if (main_idx >= 0)
         add_used(used, &nused, sig_start);
+    for (i = 0; i < wasm_nindir; i++)
+        add_used(used, &nused, wasm_indir_sigs[i]);
     add_used(used, &nused, sig_fdwrite);
     add_used(used, &nused, sig_procexit);
     wo_leb(&sec, nused);
@@ -2670,6 +2850,16 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     }
     wo_sec(&out, 3, &sec);
 
+    /* ---- table section ---- */
+    if (wasm_nfv > 0 || wasm_nindir > 0) {
+        /* (table N funcref) — needed by call_indirect even when no
+           function ADDRESS is taken (a NULL call) */
+        wo_init(&sec);
+        wo_leb(&sec, 1);
+        wo_b(&sec, 0x70); wo_b(&sec, 0x00);   /* funcref */
+        wo_leb(&sec, wasm_nfv + 1);           /* slot 0 = NULL */
+        wo_sec(&out, 4, &sec);
+    }
     /* ---- memory section ---- */
             rodata_section ? (int)rodata_section->data_offset : -1,
     data_end = (data_section->data_offset + rodata_section->data_offset
@@ -2701,7 +2891,7 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     wo_init(&sec);
     {
         int need_ctors = (wasm_nctors > 0 ? 1 : 0) + (wasm_ndtors > 0 ? 1 : 0);
-        int nexp = 1 + (main_idx >= 0 ? 2 : 0) + (wasm_nfv > 0 ? 1 : 0)
+        int nexp = 1 + (main_idx >= 0 ? 2 : 0) + ((wasm_nfv > 0 || wasm_nindir > 0) ? 1 : 0)
                  + need_ctors;
         for (i = 0; i < wasm_nfuncs; i++)
             if (wasm_funcs[i].defined && strcmp(wasm_funcs[i].name, "main"))
@@ -2710,7 +2900,7 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     }
     wo_str(&sec, "memory");
     wo_b(&sec, 2); wo_leb(&sec, 0);
-    if (wasm_nfv > 0) {
+    if (wasm_nfv > 0 || wasm_nindir > 0) {
         /* the function-value table — the env runtime resolves fn values
            (atexit handlers, fn pointers) through it */
         wo_str(&sec, "__indirect_function_table");
@@ -2739,6 +2929,39 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
             wo_b(&sec, 0); wo_leb(&sec, func_idx[i]);
         }
     wo_sec(&out, 7, &sec);
+
+    /* ---- element section: the function-value table contents ---- */
+    if (wasm_nfv > 0) {
+        wo_init(&sec);
+        wo_leb(&sec, 1);
+        wo_leb(&sec, 0);                        /* table 0 */
+        wo_b(&sec, W_I32_CONST); wo_leb(&sec, 1);  /* offset 1 (slot 0 = NULL) */
+        wo_b(&sec, W_END);
+        wo_leb(&sec, wasm_nfv);
+        for (i = 0; i < wasm_nfv; i++) {
+            int fi = -1;
+            for (k = 0; k < wasm_nfuncs; k++)
+                if (wasm_funcs[k].defined &&
+                    !strcmp(wasm_funcs[k].name, wasm_fv[i])) {
+                    fi = func_idx[k];
+                    break;
+                }
+            if (fi < 0) {
+                /* an extern function (env import) — the table needs a
+                   function index; imports precede defined funcs */
+                for (k = 0; k < wasm_nimports; k++)
+                    if (imp_idx[k] >= 0 &&
+                        !strcmp(wasm_imports[k].name, wasm_fv[i])) {
+                        fi = imp_idx[k];
+                        break;
+                    }
+            }
+            wo_leb(&sec, fi >= 0 ? fi : 0);
+        }
+        wo_sec(&out, 9, &sec);
+    }
+
+
 
     /* ---- code section ---- */
     wo_init(&sec);
@@ -2774,6 +2997,11 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                         }
                     } else if (p->kind == 1) {
                         v = w_data_addr_of(p->dsec, p->dofs);
+                    } else if (p->kind == 2 && p->name) {
+                        int fv = w_fv_find(p->name);
+                        v = (fv >= 0) ? fv + 1 : 0;   /* 1-based table slot */
+                    } else if (p->kind == 3) {
+                        v = w_sig_typeidx_of(p->sig); /* call_indirect type */
                     }
                     if (p->ofs + 5 <= wf->flen) {
                         int slot = p->ofs, t;
@@ -2876,19 +3104,34 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
     wo_sec(&out, 10, &sec);
 
     /* ---- data section ---- */
-    wo_init(&sec);
-    wo_leb(&sec, 1);
-    wo_b(&sec, 0);                     /* active, memory 0 */
-    wo_b(&sec, W_I32_CONST); wo_leb(&sec, 0);
-    wo_b(&sec, W_END);
-    wo_leb(&sec, data_section->data_offset + rodata_section->data_offset
-                 + bss_section->data_offset);
-    for (i = 0; i < data_section->data_offset; i++)
-        wo_b(&sec, data_section->data[i]);
-    for (i = 0; i < rodata_section->data_offset; i++)
-        wo_b(&sec, rodata_section->data[i]);
-    for (i = 0; i < bss_section->data_offset; i++)
-        wo_b(&sec, 0);   /* bss: no initialized content — all zeros */
+    /* resolve data/rodata relocations: an address-of-function in a
+       global initializer (int (*f)(int) = &fred) is a table slot, and
+       an address-of-data is the linear-memory address */
+    {
+        unsigned char *dbuf = tcc_malloc(data_section->data_offset
+                        + rodata_section->data_offset + bss_section->data_offset);
+        memcpy(dbuf, data_section->data, data_section->data_offset);
+        memcpy(dbuf + data_section->data_offset, rodata_section->data,
+               rodata_section->data_offset);
+        memset(dbuf + data_section->data_offset + rodata_section->data_offset,
+               0, bss_section->data_offset);
+        if (data_section->reloc)
+            w_apply_data_relocs(s, data_section, dbuf);
+        if (rodata_section->reloc)
+            w_apply_data_relocs(s, rodata_section,
+                                dbuf + data_section->data_offset);
+        wo_init(&sec);
+        wo_leb(&sec, 1);
+        wo_b(&sec, 0);                     /* active, memory 0 */
+        wo_b(&sec, W_I32_CONST); wo_leb(&sec, 0);
+        wo_b(&sec, W_END);
+        wo_leb(&sec, data_section->data_offset + rodata_section->data_offset
+                     + bss_section->data_offset);
+        for (i = 0; i < data_section->data_offset + rodata_section->data_offset
+                         + bss_section->data_offset; i++)
+            wo_b(&sec, dbuf[i]);
+        tcc_free(dbuf);
+    }
     wo_sec(&out, 11, &sec);
 
     /* ---- write the file ---- */
