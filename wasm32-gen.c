@@ -201,10 +201,10 @@ ST_DATA int func_bound_add_epilog;
 #define W_I64_SHR_U    0x88
 #define W_F32_NEG      0x8c
 #define W_F64_NEG      0x8d
-#define W_F32_ADD      0x93
-#define W_F32_SUB      0x94
-#define W_F32_MUL      0x95
-#define W_F32_DIV      0x96
+#define W_F32_ADD      0x92
+#define W_F32_SUB      0x93
+#define W_F32_MUL      0x94
+#define W_F32_DIV      0x95
 #define W_F64_ADD      0xa0
 #define W_F64_SUB      0xa1
 #define W_F64_MUL      0xa2
@@ -905,7 +905,12 @@ ST_FUNC void load(int r, SValue *sv)
             w_emit_slot_store(r, VT_INT);   /* the bits ARE the f32 */
         } else if (bt == VT_DOUBLE || bt == VT_LDOUBLE) {
             union { double d; unsigned u[2]; } u;
-            u.d = sv->c.d;
+            /* a long double constant lives in c.ld (host width), NOT in
+               c.d — on hosts where long double != double the low bytes
+               of the 80/128-bit representation are not the double
+               value, so reading c.d gave garbage (12.34l printed
+               -3.2e+26).  LDOUBLE_SIZE=8 on wasm32: truncate the value. */
+            u.d = (bt == VT_LDOUBLE) ? (double)sv->c.ld : sv->c.d;
             w_i32_const(u.u[0]);
             w_emit_slot_store(r, VT_INT);
             /* high word at slot r + 4 (the second half of the slot's
@@ -1612,7 +1617,8 @@ ST_FUNC void gen_opf(int op)
 {
     int a, b, d, dbl, o, cmp;
     gv2(RC_FLOAT, RC_FLOAT);
-    dbl = (vtop->type.t & VT_BTYPE) == VT_DOUBLE;
+    dbl = (vtop->type.t & (VT_BTYPE | VT_LONG)) == VT_DOUBLE ||
+          (vtop->type.t & VT_BTYPE) == VT_LDOUBLE;   /* LDOUBLE_SIZE=8 */
     a = vtop[-1].r; b = vtop[0].r;
     vtop--;
     if (op >= TOK_ULT && op <= TOK_GT) {
