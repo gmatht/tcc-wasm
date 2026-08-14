@@ -393,8 +393,17 @@ ST_FUNC void g(int c)
        (60_errors' `int i = i++;` crashed on the NULL wasm_cf) */
     if (!wasm_cf)
         return;
-    if (nocode_wanted)
+    if (nocode_wanted) {
+        /* fill the suppressed region with NOPs: the layout slices the
+           raw code by POSITION, and the stale bytes left by the
+           early-return (from an earlier function's exit) leaked into
+           the emitted module (03_struct's leading unreachables) */
+        if (wasm_cf->csize <= ind)
+            wasm_cf->code = wa_grow(wasm_cf->code, &wasm_cf->csize,
+                                    ind + 1, 1);
+        wasm_cf->code[ind++] = 0x01;
         return;
+    }
     if (wasm_cf->csize <= ind) {
         /* grow when the buffer is FULL (<=, not ==: under nocode_wanted
            w_ins() advances ind without emitting, so after a dead-code
@@ -411,7 +420,7 @@ static void w_ins(int op)
     if (!wasm_cf)
         return;   /* data-initializer evaluation outside any function */
     if (nocode_wanted) {
-        ind++;
+        g(0x01);
         return;
     }
     wasm_cf->inspos = wa_grow(wasm_cf->inspos, &wasm_cf->ins_alloc,
