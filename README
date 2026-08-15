@@ -91,3 +91,76 @@ TCC is distributed under the GNU Lesser General Public License (see
 COPYING file).
 
 Fabrice Bellard.
+
+-----------------------------------------------------------------------
+WASM32 backend status (this fork)
+---------------------------------
+
+This fork's `wasm32-gen.c` targets WebAssembly (core 1.0, no bulk-memory
+beyond a `memory.copy` import shim) and is validated against the upstream
+tests2 corpus via `tests/wasm-corpus/run-corpus.mjs` (the runner's JS libc
+in `/root/src/sh2runtime/src/c-runtime.js` provides the `env.$*` imports).
+
+Current status (2026-08-15, mob@2b5a9e6): 111/122 PASS, 9 NO-EXPECT
+(companion files the corpus does not score), 1 WRONG, 1 REFUSE, 0
+COMPILE-OUT, 0 RUN-CRASH, 0 RUN-TIMEOUT.
+
+The wasm32 codegen model
+------------------------
+
+- every function body is a pc-dispatch: `local.get $pc; br_table` over
+  nested pad blocks.  A `WasmLabel`/`WasmEdge`/`WasmSeg` graph is laid
+  out per function (`w_layout`) into those subs; jumps set `$pc` and
+  `br` back to the dispatcher.
+- structs are passed by value via caller-side parking temps (the callee
+  receives a pointer); the whole parking depth is reserved by lowering
+  sp so the callee's frame cannot clobber the temps.
+- function pointers use a funcref table (`__indirect_function_table`,
+  slot 0 = NULL): a function's address resolves to its table slot, and
+  an indirect call pops the slot and emits `call_indirect` with a
+  patchable type index.  Address-taken externs (global fn-ptr
+  initializers, `&extern_fn` args) are registered as env imports with
+  the per-call signature; the element section matches the import's
+  signature to the call that pops the slot.
+- computed gotos: `&&label` values resolve to the dispatch sub index of
+  the label's position; address-taken labels split a block so the value
+  is dispatchable.  Weak/static-inline refs resolve to NULL; `__asm__`-
+  and `__attribute__((alias))`-renamed symbols resolve to their targets.
+- dead regions (NOEVAL statement-expressions) are NOP-filled and their
+  loop back-edges are suppressed so the code falls through instead of
+  looping.
+
+Remaining failures (both are feature gaps / edge cases, not regressions)
+
+- `96_nodata_wanted` (WRONG, one line): the `&&label` address-difference
+  size measurement reports `zero` for the text size — the label values
+  are sub indices and the `ts1`/`te1` pair lands in the same dispatch
+  sub (the `if (!SKIP) {}` between them folds to no code).  The correct
+  fix (splitting at code-only `&&label` refs) conflicts with
+  `87_dead_code`'s own address-taken labels in dead/control regions, and
+  no sym-table discriminator separates the two cases.
+- `73_arm64` (REFUSE): the ARM64 HFA struct-vararg calling convention
+  (structs > 4 bytes as varargs, plus the c-runtime's `%hfaNN` printf
+  formats) is unimplemented — the backend errors on large struct
+  varargs.
+
+Sandbox self-containment
+------------------------
+
+The wasm32 target runs inside a wasi sandbox with no libc of its own
+(the JS runtime provides the `env.$*` imports), so symbols that would
+pull in musl glue are synthesized instead:
+
+- `__syscall_*` references compile to internal stubs returning -1 (no
+  env import, no undefined-symbol error).
+- the wait family (`wait`, `waitpid`, `wait4`, `waitid`) compile to
+  stubs returning -10 (ECHILD — the sandbox has no child processes),
+  and the fork ships `include/sys/wait.h` (the wasi sysroot omits it)
+  so programs that include it still compile.  The `rusage` parameter is
+  an opaque `void*` so `sys/resource.h`'s `#error` gate is not pulled
+  in.
+
+History note: the fork's wasm32 backend was rewritten twice (a lost
+51-commit state at 110 PASS was recovered from session transcripts to
+`99e60d8..372f7d1` on the `mob` branch).  `recovery/` holds the replay
+engine and the op log used for that recovery.
