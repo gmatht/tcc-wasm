@@ -1943,6 +1943,59 @@ static int w_import_get(const char *name, int sig)
     return wasm_nimports++;
 }
 
+/* a __syscall_* reference (a musl-libc syscall wrapper like
+   __syscall_getresgid32 / __syscall_wait4) is meaningless in the wasm
+   sandbox — there is no real uid/gid, no real child processes.  Instead
+   of emitting it as an env import (which the runtime may not provide,
+   or warn about), synthesize an internal stub that returns -1 — the
+   musl convention for an unsupported syscall (the wrapper then sets
+   errno = 1 and returns -1 to the caller, which degrades gracefully).
+   The output stays self-contained: no import, no runtime warning. */
+static int w_syscall_stub(const char *nm, int sig)
+{
+    int i;
+    for (i = 0; i < wasm_nfuncs; i++)
+        if (wasm_funcs[i].defined && !strcmp(wasm_funcs[i].name, nm))
+            return i;   /* already stubbed (or a real definition won) */
+    i = wasm_nfuncs++;
+    wasm_funcs = wa_grow(wasm_funcs, &wasm_func_alloc,
+                         wasm_nfuncs, sizeof(WasmFuncRef));
+    wasm_funcs[i].name = tcc_strdup(nm);
+    wasm_funcs[i].sym = NULL;
+    wasm_funcs[i].sig = sig;
+    wasm_funcs[i].defined = 1;
+    wasm_funcs[i].import = 0;
+    wasm_funcs[i].order = wasm_ndef++;
+    {
+        /* a synthetic WasmFunc whose final body is i32.const -1; end —
+           the params are unused (legal in wasm: params are locals) */
+        WasmFunc *wf = tcc_mallocz(sizeof(WasmFunc));
+        wf->order = wasm_funcs[i].order;   /* must MATCH the ref's order
+                                              (w_func_by_order finds it) */
+        wf->final = tcc_malloc(3);
+        wf->final[0] = W_I32_CONST;
+        wf->final[1] = 0x7f;
+        wf->final[2] = W_END;
+        wf->flen = 3;
+        wf->nparams = 0;
+        wf->nlocals = 6;
+        wasm_func_list = wa_grow(wasm_func_list, &wasm_func_list_alloc,
+                                 wasm_nfunc_list + 1, sizeof(WasmFunc *));
+        wasm_func_list[wasm_nfunc_list++] = wf;
+    }
+    return i;
+}
+
+/* register a call to an undefined function: __syscall_* -> stub,
+   everything else -> env import */
+static void w_undef_func(const char *nm, int sig)
+{
+    if (!strncmp(nm, "__syscall_", 10))
+        w_syscall_stub(nm, sig);
+    else
+        w_import_get(nm, sig);
+}
+
 /* signature for a call: declared fixed params plus, for variadic
    functions, this call's actual (promoted) vararg types.  Default
    promotions (float→double etc.) are applied by the frontend
@@ -2118,7 +2171,7 @@ ST_FUNC void gfunc_call(int nb_args)
        per distinct signature — wasm allows same-name imports with
        different types, and the shell's JS runtime takes (...args).
        Functions defined later in this TU shadow the import at output. */
-    w_import_get(get_tok_str(sym->v, NULL), sig);
+    w_undef_func(get_tok_str(sym->v, NULL), sig);
     /* spill live register values (e.g. a previous call's result in the
        shared return slot) so the callee can clobber them */
     save_regs(nb_args + 1);
@@ -3066,6 +3119,8 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                     ELFW(ST_TYPE)(es->st_info) != STT_FUNC ||
                     ELFW(ST_BIND)(es->st_info) == STB_WEAK)
                     continue;
+                if (!strncmp(&((char *)symtab_section->link->data)[es->st_name], "__syscall_", 10))
+                    continue;   /* a musl syscall wrapper — stubbed at output */
                 want = wa_grow(want, &walloc, nwant + 1, sizeof(char *));
                 want[nwant++] = &((char *)symtab_section->link->data)[es->st_name];
             }
@@ -3077,6 +3132,7 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                 continue;
             for (j = 0; j < wf->npatches; j++)
                 if (wf->patches[j].kind == 2 && wf->patches[j].name &&
+                    strncmp(wf->patches[j].name, "__syscall_", 10) &&
                     !w_sym_weak_undef(wf->patches[j].sym,
                                       wf->patches[j].name)) {
                     int isdef = 0;
