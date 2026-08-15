@@ -1951,7 +1951,7 @@ static int w_import_get(const char *name, int sig)
    musl convention for an unsupported syscall (the wrapper then sets
    errno = 1 and returns -1 to the caller, which degrades gracefully).
    The output stays self-contained: no import, no runtime warning. */
-static int w_syscall_stub(const char *nm, int sig)
+static int w_syscall_stub(const char *nm, int sig, int ret)
 {
     int i;
     for (i = 0; i < wasm_nfuncs; i++)
@@ -1974,7 +1974,7 @@ static int w_syscall_stub(const char *nm, int sig)
                                               (w_func_by_order finds it) */
         wf->final = tcc_malloc(3);
         wf->final[0] = W_I32_CONST;
-        wf->final[1] = 0x7f;
+        wf->final[1] = (ret == -10) ? 0x76 : 0x7f;   /* -10 (ECHILD) : -1 */
         wf->final[2] = W_END;
         wf->flen = 3;
         wf->nparams = 0;
@@ -1986,14 +1986,20 @@ static int w_syscall_stub(const char *nm, int sig)
     return i;
 }
 
-/* register a call to an undefined function: __syscall_* -> stub,
-   everything else -> env import */
+/* register a call to an undefined function: __syscall_* and the wait
+   family (meaningless in the wasm sandbox — no uid/gid, no children)
+   -> internal stubs (wait family returns ECHILD -10, the truth about a
+   process with no children); everything else -> env import */
 static void w_undef_func(const char *nm, int sig)
 {
-    if (!strncmp(nm, "__syscall_", 10))
-        w_syscall_stub(nm, sig);
-    else
+    if (!strncmp(nm, "__syscall_", 10)) {
+        w_syscall_stub(nm, sig, -1);
+    } else if (!strcmp(nm, "wait") || !strcmp(nm, "waitpid") ||
+               !strcmp(nm, "wait4")) {
+        w_syscall_stub(nm, sig, -10);
+    } else {
         w_import_get(nm, sig);
+    }
 }
 
 /* signature for a call: declared fixed params plus, for variadic
