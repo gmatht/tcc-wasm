@@ -1986,20 +1986,32 @@ static int w_syscall_stub(const char *nm, int sig, int ret)
     return i;
 }
 
-/* register a call to an undefined function: __syscall_* and the wait
-   family (meaningless in the wasm sandbox — no uid/gid, no children)
-   -> internal stubs (wait family returns ECHILD -10, the truth about a
-   process with no children); everything else -> env import */
+/* stub value for a name the sandbox must synthesize (0 = not a stub):
+   __syscall_* and system() are meaningless (no uid/gid, no shell), and
+   the wait family (no child processes) — -1 like an unsupported
+   syscall, -10 = ECHILD for the waits. */
+static int w_stub_ret(const char *nm)
+{
+    if (!strncmp(nm, "__syscall_", 10))
+        return -1;
+    if (!strcmp(nm, "system"))
+        return -1;
+    if (!strcmp(nm, "wait") || !strcmp(nm, "waitpid") ||
+        !strcmp(nm, "wait4") || !strcmp(nm, "waitid"))
+        return -10;
+    return 0;
+}
+
+/* register a call to an undefined function: __syscall_*, system(), and
+   the wait family (meaningless in the wasm sandbox — no uid/gid, no
+   children, no shell) -> internal stubs; everything else -> env import */
 static void w_undef_func(const char *nm, int sig)
 {
-    if (!strncmp(nm, "__syscall_", 10)) {
-        w_syscall_stub(nm, sig, -1);
-    } else if (!strcmp(nm, "wait") || !strcmp(nm, "waitpid") ||
-               !strcmp(nm, "wait4")) {
-        w_syscall_stub(nm, sig, -10);
-    } else {
+    int ret = w_stub_ret(nm);
+    if (ret)
+        w_syscall_stub(nm, sig, ret);
+    else
         w_import_get(nm, sig);
-    }
 }
 
 /* signature for a call: declared fixed params plus, for variadic
@@ -3125,7 +3137,7 @@ ST_FUNC int wasm_output_file(TCCState *s, const char *filename)
                     ELFW(ST_TYPE)(es->st_info) != STT_FUNC ||
                     ELFW(ST_BIND)(es->st_info) == STB_WEAK)
                     continue;
-                if (!strncmp(&((char *)symtab_section->link->data)[es->st_name], "__syscall_", 10))
+                if (w_stub_ret(&((char *)symtab_section->link->data)[es->st_name]))
                     continue;   /* a musl syscall wrapper — stubbed at output */
                 want = wa_grow(want, &walloc, nwant + 1, sizeof(char *));
                 want[nwant++] = &((char *)symtab_section->link->data)[es->st_name];
